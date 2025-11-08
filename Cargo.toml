@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+cotton-usb-host = { version = "0.2.1", default-features = false }
+defmt = "1.0"
+futures-core = { version = "0.3.31", default-features = false }
+imxrt-ral = "0.6"

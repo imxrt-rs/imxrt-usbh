@@ -1,0 +1,40 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - run: rustup toolchain install stable --no-self-update --profile minimal
+    - run: cargo fmt --verbose --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - run: rustup toolchain install stable --no-self-update --profile minimal --component clippy
+    # Small chip => fast to build => fast answers
+    - run: cargo clippy --tests --features=imxrt-ral/imxrt1011 -- -D warnings
+
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Should be enough coverage, but feel free to add more.
+        chip: [imxrt1011, imxrt1062, imxrt1176_cm7]
+    steps:
+    - uses: actions/checkout@v4
+    - run: rustup toolchain install stable --no-self-update --profile minimal
+    - run: cargo test --features=imxrt-ral/${{ matrix.chip }}
+
+  target:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        chip: [imxrt1011, imxrt1062, imxrt1176_cm7]
+    steps:
+    - uses: actions/checkout@v4
+    - run: rustup toolchain install stable --no-self-update --profile minimal --target thumbv7em-none-eabihf
+    - run: cargo build --target=thumbv7em-none-eabihf --features=imxrt-ral/${{ matrix.chip }}
