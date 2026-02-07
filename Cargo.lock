@@ -392,7 +392,9 @@ dependencies = [
 name = "imxrt-usbh"
 version = "0.1.0"
 dependencies = [
+ "bitflags 2.10.0",
  "board",
+ "cortex-m",
  "defmt 0.3.100",
  "imxrt-hal",
  "imxrt-iomuxc",
@@ -400,6 +402,7 @@ dependencies = [
  "imxrt-ral",
  "imxrt-rt",
  "log",
+ "ral-registers",
  "rtic",
  "teensy4-fcb 0.4.0",
  "teensy4-panic",

@@ -3,7 +3,7 @@
 **Estimated effort**: 2-3 days  
 **Key milestone**: Controller in host mode, no faults
 
-## 1.1 Register Access Setup
+## 1.1 Register Access Setup ✅ DONE
 
 - [x] ~~Audit `imxrt-ral` v0.6.1 USB register definitions~~ → Using `imxrt-usbd` RAL instead
   - **Decision**: Copy the RAL module from `imxrt-usbd/src/ral/` rather than depending on
@@ -28,18 +28,21 @@
 - [x] ~~Define constants for any bit-field values not provided by the RAL~~ → All needed fields are defined
 - [x] ~~Document all register name mappings~~ → See Overview.md register mapping table
 
-**Files to create/modify**:
-- `src/lib.rs` — Crate root, re-exports, `Peripherals` trait (adopt pattern from `imxrt-usbd`)
-- `src/ral.rs` — RAL glue module (re-exports, `Instances` struct) — copied from `imxrt-usbd`
-- `src/ral/usb.rs` — USB core register definitions — copied from `imxrt-usbd`
-- `src/ral/usbphy.rs` — USB PHY register definitions — copied from `imxrt-usbd`
-- `src/ehci.rs` — EHCI data structures (QH, qTD, frame list)
-- `src/host.rs` — `Imxrt1062HostController`, `UsbShared`, `UsbStatics`
-- `src/cache.rs` — Cache coherency utilities — copied from `imxrt-usbd`
-- `src/vcell.rs` — Volatile cell for DMA structures — copied from `imxrt-usbd`
-- `src/gpt.rs` — USB general purpose timers — copied from `imxrt-usbd`
-- `src/log.rs` — defmt logging macros — copied from `imxrt-usbd`
-- `src/pool.rs` — Async resource pool (or reuse `cotton-usb-host`'s `async_pool` if accessible)
+**Files created/modified** (all verified compiling with `cargo check --target thumbv7em-none-eabihf`):
+- [x] `src/lib.rs` — Crate root with `#![no_std]`, `Peripherals` trait, module declarations
+- [x] `src/ral.rs` — RAL glue module: re-exports `ral_registers` macros, `Instances` struct, `instances()` converter
+- [x] `src/ral/usb.rs` — USB core register definitions (3381 lines, copied from `imxrt-usbd`)
+- [x] `src/ral/usbphy.rs` — USB PHY register definitions (1694 lines, copied from `imxrt-usbd`)
+- [x] `src/cache.rs` — D-cache clean+invalidate for DMA coherency (copied from `imxrt-usbd`)
+- [x] `src/vcell.rs` — `VCell<T>` volatile cell for DMA-visible data structures (copied from `imxrt-usbd`)
+- [x] `src/gpt.rs` — USB general purpose timers with host-mode documentation (adapted from `imxrt-usbd`)
+- [x] `src/log.rs` — Conditional defmt macros, feature-gated behind `defmt-03` (copied from `imxrt-usbd`)
+- [ ] `Cargo.toml` — Updated: `ral-registers = "0.1"`, `cortex-m = "0.7"`, `bitflags = "2"`, optional `defmt-03`
+
+**Not yet created** (deferred to phases 1.2 and 1.3):
+- `src/ehci.rs` — EHCI data structures (QH, qTD, frame list) → Phase 1.2
+- `src/host.rs` — `Imxrt1062HostController`, `UsbShared`, `UsbStatics` → Phase 1.2
+- `src/pool.rs` — Async resource pool → Phase 1.2
 
 ## 1.2 Data Structures
 
