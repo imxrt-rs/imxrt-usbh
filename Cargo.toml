@@ -7,6 +7,9 @@ edition = "2024"
 cortex-m = "0.7"
 ral-registers = "0.1"
 bitflags = "2"
+cotton-usb-host = { path = "../cotton/cotton-usb-host", default-features = false }
+rtic-common = "1"
+critical-section = "1.1"
 
 [dependencies.defmt-03]
 package = "defmt"
