@@ -26,6 +26,8 @@
 mod log;
 
 mod cache;
+pub mod ehci;
+pub mod host;
 pub(crate) mod ral;
 mod vcell;
 

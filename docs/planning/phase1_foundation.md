@@ -44,79 +44,97 @@
 - `src/host.rs` — `Imxrt1062HostController`, `UsbShared`, `UsbStatics` → Phase 1.2
 - `src/pool.rs` — Async resource pool → Phase 1.2
 
-## 1.2 Data Structures
+## 1.2 Data Structures ✅ DONE
 
 Following the RP2040 pattern of `UsbShared` / `UsbStatics` / `HostController`:
 
-- [ ] Define `UsbShared` structure (interrupt-handler ↔ async task shared data)
+- [x] Define `UsbShared` structure (interrupt-handler ↔ async task shared data)
   - `device_waker: CriticalSectionWakerRegistration` — woken on port change (PORTSC CSC)
-  - `pipe_wakers: [CriticalSectionWakerRegistration; N]` — woken on transfer completion per-pipe
-  - `fn on_irq(&self)` — called from `USB_OTG2` ISR (IRQ #112)
-  - Must be `const fn new()` so it can be placed in a `static`
-- [ ] Define `UsbStatics` structure (static lifetime, not shared with ISR)
+  - `pipe_wakers: [CriticalSectionWakerRegistration; NUM_PIPE_WAKERS]` — woken on transfer completion per-pipe (NUM_PIPE_WAKERS = NUM_QH + 1 = 5)
+  - `async_advance_waker: CriticalSectionWakerRegistration` — woken on async advance doorbell (QH removal)
+  - `fn on_irq(&self, usb: &ral::usb::Instance)` — called from `USB_OTG2` ISR (IRQ #112)
+  - `const fn new()` — all wakers initialized empty
+  - Implements disable-on-handle / re-enable-on-poll interrupt pattern
+  - `unsafe impl Sync` for ISR ↔ task sharing
+- [x] Define `UsbStatics` structure (static lifetime, not shared with ISR)
   - `control_pipes: Pool` — Pool of 1 (only one EP0 control transfer at a time)
-  - `bulk_pipes: Pool` — Pool of N bulk/interrupt pipe slots
-  - `qh_pool: [QueueHead; N]` — Pre-allocated, 64-byte aligned QH storage
-  - `qtd_pool: [TransferDescriptor; M]` — Pre-allocated, 32-byte aligned qTD storage
-  - `frame_list: [u32; 1024]` — 4KB-aligned periodic frame list (or smaller power-of-2)
-  - Must be `const fn new()` for use with `ConstStaticCell`
-- [ ] Define `Imxrt1062HostController` structure
-  - `shared: &'static UsbShared`
-  - `statics: &'static UsbStatics`
-  - `usb: imxrt_ral::usb::USB2` — USB OTG2 register block (ownership, not reference)
-  - `usbphy: imxrt_ral::usbphy::USBPHY2` — PHY register block (ownership)
+  - `bulk_pipes: Pool` — Pool of NUM_QH (4) bulk/interrupt pipe slots
+  - `qh_pool: [QueueHead; NUM_QH + 1]` — Pre-allocated, 64-byte aligned QH storage (+1 for sentinel)
+  - `qtd_pool: [TransferDescriptor; NUM_QTD]` — Pre-allocated, 32-byte aligned qTD storage (16 slots)
+  - `frame_list: FrameList` — 4KB-aligned periodic frame list (32 entries)
+  - `const fn new()` — all pools empty, structures zeroed
+- [x] Define `Imxrt1062HostController` structure
+  - `usb: ral::usb::Instance` — USB OTG core registers (owned)
+  - `usbphy: ral::usbphy::Instance` — PHY registers (owned)
+  - `shared: &'static UsbShared` — ISR-safe shared state
+  - `statics: &'static UsbStatics` — resource pools
+  - `fn new<P: Peripherals>(peripherals, shared, statics)` — construction from Peripherals trait
 
-### EHCI DMA Structures
+### EHCI DMA Structures — Implemented in `src/ehci.rs`
 
-Must be `#[repr(C)]` for hardware compatibility:
+All `#[repr(C)]` with compile-time size/alignment assertions:
 
-```rust
-/// Queue Head — 48 bytes minimum, must be 64-byte aligned (EHCI 3.6)
-/// Contains endpoint characteristics + overlay area for active qTD
-#[repr(C, align(64))]
-struct QueueHead {
-    horizontal_link: u32,       // Next QH pointer (or T-bit for termination)
-    endpoint_characteristics: u32, // Address, endpoint, speed, max packet size
-    endpoint_capabilities: u32, // Split transaction fields, interrupt schedule mask
-    current_qtd: u32,          // Pointer to current qTD being processed
-    // Overlay area (copied from qTD when transfer starts):
-    next_qtd: u32,
-    alt_next_qtd: u32,
-    token: u32,                // Status, PID, error count, bytes to transfer
-    buffer_ptrs: [u32; 5],     // Buffer page pointers (4KB aligned)
-    // Padding to 64 bytes
-}
+- [x] `TransferDescriptor` (qTD) — 32 bytes, `#[repr(C, align(32))]`
+  - Fields: `next`, `alt_next`, `token`, `buffer[5]` (all `VCell<u32>`)
+  - Helper: `qtd_token(pid, total_bytes, data_toggle, ioc)` builds the token word
+  - Helper: `qtd_token_bytes_remaining(token)` extracts remaining bytes
+  - Methods: `new()`, `init()`, `is_complete()`, `has_error()`, `bytes_remaining()`
+  - Constants: `QTD_TOKEN_ACTIVE`, `QTD_TOKEN_HALTED`, `QTD_TOKEN_IOC`, `QTD_TOKEN_ERROR_MASK`, etc.
+- [x] `QueueHead` (QH) — 64 bytes, `#[repr(C, align(64))]`
+  - Hardware words 0–11: `horizontal_link`, `characteristics`, `capabilities`, `current_qtd`,
+    overlay fields inlined (`overlay_next`, `overlay_alt_next`, `overlay_token`, `overlay_buffer[5]`)
+  - Software words 12–15: `attached_qtd`, `attached_buffer`, `sw_flags`, `sw_pid`, `sw_interval_ms`, padding
+  - Note: overlay fields are inlined (not an embedded `TransferDescriptor`) to avoid `align(32)` padding
+  - Helper: `qh_characteristics(address, endpoint, speed, max_packet_size, is_control, is_head)`
+  - Helper: `qh_capabilities(smask, cmask, hub_addr, hub_port, mult)`
+  - Methods: `new()`, `init_sentinel()`, `init_endpoint()`, `attach_qtd()`, `link_after()`
+- [x] `FrameList` — 4096-byte aligned, 32 entries (configurable via `FRAME_LIST_LEN`)
+  - Each entry is `VCell<u32>` — either `LINK_TERMINATE` or a link pointer to a QH
+- [x] Link pointer helpers: `link_pointer()`, `link_address()`, `link_is_terminate()`, `link_type::*`
+- [x] PID codes: `PID_OUT`, `PID_IN`, `PID_SETUP`
+- [x] Speed codes: `SPEED_FULL`, `SPEED_LOW`, `SPEED_HIGH`
 
-/// Queue Transfer Descriptor — 32 bytes, must be 32-byte aligned (EHCI 3.5)
-#[repr(C, align(32))]
-struct TransferDescriptor {
-    next_qtd: u32,             // Next qTD pointer (or T-bit)
-    alt_next_qtd: u32,         // Alternate next qTD (used on short packets)
-    token: u32,                // Active bit, PID, error count, bytes to transfer, data toggle
-    buffer_ptrs: [u32; 5],     // Buffer page pointers
-}
-```
+### Pool Allocation — Using `cotton-usb-host::async_pool`
 
-### Key Alignment and Cache Considerations
+- [x] ~~Implement custom pool~~ → Reusing cotton-usb-host's public `Pool`/`Pooled`/`BitSet`
+  - `cotton-usb-host` is a path dependency with `default-features = false` (no RP2040 code pulled in)
+  - `Pool` provides async `alloc()` and sync `try_alloc()` with RAII `Pooled` return type
+  - `Pooled` auto-returns resource to pool on Drop
+  - `CriticalSectionWakerRegistration` from `rtic-common = "1"` for ISR-safe waker storage
 
-- QH must be 64-byte aligned (EHCI spec requires 32-byte, but 64 avoids cache-line sharing between QHs — each QH gets its own cache line pair)
-- qTD must be 32-byte aligned (matches cache line size, prevents false sharing)
-- Frame list must be 4KB-aligned (or smaller: 256/512/1024 entries)
-- All these structures are DMA-accessed — every read/write by CPU requires cache invalidate/flush
+### Dependencies Added (Cargo.toml)
 
-### Challenge: DMA Buffer Management and Lifetimes
+- `cotton-usb-host = { path = "../cotton/cotton-usb-host", default-features = false }` — Pool, HostController trait
+- `rtic-common = "1"` — `CriticalSectionWakerRegistration`
+- `critical-section = "1.1"` — critical section primitives
 
-**Problem**: EHCI requires linked lists of QH/qTD descriptors in DMA-accessible memory with stable physical addresses. Rust's ownership model makes this tricky.
+**Files created/modified** (all verified compiling with `cargo check --target thumbv7em-none-eabihf`):
+- [x] `src/ehci.rs` — EHCI DMA structures (QH, qTD, FrameList), link pointer helpers, token/characteristic builders (~590 lines)
+- [x] `src/host.rs` — `UsbShared`, `UsbStatics`, `Imxrt1062HostController` (~315 lines)
+- [x] `src/lib.rs` — Added `pub mod ehci; pub mod host;`
+- [x] `Cargo.toml` — Added `cotton-usb-host`, `rtic-common`, `critical-section`
 
-**Solution**:
-- Pre-allocate fixed pools of QH and qTD structures in `UsbStatics` (via `ConstStaticCell`)
-- Use index-based pool allocation (similar to RP2040's `async_pool::Pool` with `BitSet`)
-- Pool sizes are compile-time constants — no heap allocation
-- `Pooled` wrapper type with `Drop` impl returns resources to pool automatically
-- Suggested initial pool sizes: **4 QHs, 16 qTDs** (supports 1 control + 3 concurrent bulk/interrupt)
-  - Each control transfer uses 1 QH + 2-3 qTDs
-  - Each interrupt pipe uses 1 QH + 1 qTD (re-armed)
-  - Each bulk transfer uses 1 QH + 1-N qTDs (depending on transfer size)
+### Design Decisions Made
+
+1. **Overlay inlining**: QH overlay fields are individual `VCell<u32>` fields rather than an embedded
+   `TransferDescriptor`, because `TransferDescriptor`'s `align(32)` would insert 16 bytes of padding
+   inside the QH (at offset 16, the overlay needs to reach a 32-byte boundary), breaking the 64-byte
+   layout.
+
+2. **Pool reuse**: `cotton-usb-host::async_pool::Pool` is public API and works in `no_std` with no
+   feature gates. No need to reimplement. `Pool` uses `Cell<BitSet>` + `RefCell<Option<Waker>>`,
+   which is `!Send`/`!Sync` — correct for single-core Cortex-M7.
+
+3. **Frame list size**: 32 entries (matching USBHost_t36), providing 32ms of scheduling granularity.
+   This is a good balance between memory (128 bytes of useful data, 4096 with alignment) and interrupt
+   endpoint scheduling flexibility.
+
+4. **ISR pattern**: `UsbShared::on_irq()` reads USBSTS, W1C-acknowledges, wakes wakers, and masks
+   serviced interrupts in USBINTR. NXP-specific bits 18 (UAI) and 19 (UPI) are checked for
+   async/periodic completion in addition to standard USBINT (bit 0).
+
+5. **DTCM vs OCRAM**: Deferred. Starting with regular RAM + cache management. Can switch to DTCM
+   (non-cached) placement later if cache coherency bugs are persistent (see Open Question 1).
 
 ## 1.3 Initialization Sequence
 
@@ -149,14 +167,18 @@ Detailed initialization steps (order matters):
 ## Open Questions
 
 1. **Q**: Should we use DTCM or regular OCRAM for QH/qTD structures?
-   **A**: TBD — DTCM avoids cache issues but is limited. Start with OCRAM + cache management. Profile and switch if cache bugs are persistent. **Decision point**: Phase 1.2 (data structure placement).
+   **A**: TBD — DTCM avoids cache issues but is limited. Start with OCRAM + cache management. Profile and switch if cache bugs are persistent. **Decision point**: Phase 1.3 or later.
 
-2. **Q**: How many QH/qTD should we pre-allocate?
-   **A**: Start with **4 QH, 16 qTD**. Rationale: 1 QH for control (EP0), up to 3 for concurrent bulk/interrupt. Each transfer uses 1-3 qTDs. Scale up if `AllPipesInUse` errors occur frequently. The RP2040 uses 1 control + 15 bulk/interrupt = 16 total pipes.
+2. **Q**: ~~How many QH/qTD should we pre-allocate?~~
+   **A**: ✅ **Resolved.** Using **NUM_QH=4 QH + 1 sentinel = 5 QH slots**, **NUM_QTD=16 qTD slots**.
+   The sentinel QH is always allocated (async schedule head). 1 QH for control (EP0), up to 3 for
+   concurrent bulk/interrupt. Pool sizes can be adjusted by changing constants in `src/host.rs`.
 
 3. **Q**: ~~How to handle the `PERIODICLISTBASE`/`DEVICEADDR` register alias?~~
    **A**: ✅ **Resolved.** The `imxrt-usbd` RAL already defines `DEVICEADDR::BASEADR` for
    host-mode access. Use `ral::write_reg!(ral::usb, usb, DEVICEADDR, BASEADR: (addr >> 12))`.
 
-4. **Q**: Should we use `cotton-usb-host`'s internal `async_pool::Pool` or implement our own?
-   **A**: Check if `async_pool` is re-exported/public. If not, implement a similar pool using `AtomicU32` bitset + `CriticalSectionWakerRegistration`. The pattern is simple (~100 lines). **Decision point**: Phase 1.2.
+4. **Q**: ~~Should we use `cotton-usb-host`'s internal `async_pool::Pool` or implement our own?~~
+   **A**: ✅ **Resolved.** `Pool`, `Pooled`, and `BitSet` are public API in `cotton-usb-host`.
+   Added as a path dependency with `default-features = false` (pulls in only `core`, `critical-section`,
+   `futures` — no RP2040-specific code). No need to reimplement.
