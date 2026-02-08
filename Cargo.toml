@@ -20,6 +20,7 @@ optional = true
 defmt-03 = ["dep:defmt-03"]
 
 [dev-dependencies]
+defmt = "0.3"
 imxrt-hal = { path = "../imxrt-hal", features = [ "imxrt1060" ] }
 imxrt-iomuxc = { version = "0.3.0", features = ["imxrt1060"] }
 imxrt-ral = { version = "0.6.1", features = ["imxrt1062"] }

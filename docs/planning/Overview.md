@@ -120,16 +120,18 @@ pub trait HostController {
 
 ## Implementation Phases
 
-### Phase 1: Foundation and Hardware Initialization
+### Phase 1: Foundation and Hardware Initialization ✅ COMPLETE
 
 **Estimated effort**: 2-3 days | **Milestone**: Controller in host mode, no faults  
-📄 **[Full details →](phases/phase1_foundation.md)**
+📄 **[Full details →](phase1_foundation.md)** | 📄 **[Debugging log →](phase1_debugging.md)**
 
-- Copy RAL module from `imxrt-usbd` (includes all host-mode register fields); document EHCI-to-RAL name mappings
-- Define core data structures: `UsbShared` (ISR ↔ async), `UsbStatics` (pools), `Imxrt1062HostController`
-- Define EHCI DMA structures: `QueueHead` (64-byte aligned) and `TransferDescriptor` (32-byte aligned)
-- Implement 12-step initialization sequence: clocks → PHY reset → host mode → schedule init → interrupts → run
-- Create source files: `src/ehci.rs`, `src/host.rs`, `src/cache.rs`, `src/pool.rs`
+- ✅ Copy RAL module from `imxrt-usbd` (includes all host-mode register fields); document EHCI-to-RAL name mappings
+- ✅ Define core data structures: `UsbShared` (ISR ↔ async), `UsbStatics` (pools), `Imxrt1062HostController`
+- ✅ Define EHCI DMA structures: `QueueHead` (64-byte aligned) and `TransferDescriptor` (32-byte aligned)
+- ✅ Implement 13-step initialization sequence: clocks → PHY reset → host mode → schedule init → interrupts → run
+- ✅ Create source files: `src/ehci.rs`, `src/host.rs`, `src/cache.rs`, `src/vcell.rs`, `src/gpt.rs`
+- ✅ Device detection confirmed: low-speed keyboard detected (CCS=1, PSPD=1) with external 5V power
+- ⚠️ VBUS GPIO (GPIO_EMC_40 → load switch) deferred — registers correct but pin not driving; using external 5V
 
 ### Phase 2: Core HostController Trait Implementation
 
@@ -290,6 +292,50 @@ See [imxrt-usbd-reuse-analysis.md](planning/imxrt-usbd-reuse-analysis.md) for fu
 | USBPHY1 | `usbphy::USBPHY1` | `0x400D_9000` | 65 |
 | USBPHY2 | `usbphy::USBPHY2` | `0x400D_A000` | 66 |
 
+### Coding Guidelines: Prefer Symbolic RAL Access
+
+**Always use symbolic RAL names** instead of raw memory addresses to avoid off-by-one
+or wrong-address bugs. Raw pointer access with hardcoded addresses is error-prone
+and has caused debugging time in this project (e.g., using GPIO7 address when GPIO8
+was intended).
+
+**Available RAL modules for i.MX RT 1062** (via `imxrt-ral` crate with `imxrt1062` feature):
+
+| Peripheral | RAL Module | Usage |
+|------------|------------|-------|
+| USB OTG | `ral::usb::{USB1, USB2}` | Host/device controller registers |
+| USBPHY | `ral::usbphy::{USBPHY1, USBPHY2}` | PHY control (power, reset) |
+| GPIO (standard) | `ral::gpio::{GPIO1..GPIO5}` | Standard GPIO banks |
+| GPIO (fast) | `ral::gpio::{GPIO6..GPIO9}` | Fast GPIO banks (GPIO6=GPIO1, GPIO7=GPIO2, **GPIO8=GPIO3**, GPIO9=GPIO4) |
+| IOMUXC | `ral::iomuxc::IOMUXC` | Pad mux/config (e.g., `SW_MUX_CTL_PAD_GPIO_EMC_40`) |
+| IOMUXC_GPR | `ral::iomuxc_gpr::IOMUXC_GPR` | General purpose registers |
+| CCM_ANALOG | `ral::ccm_analog::CCM_ANALOG` | PLL control (e.g., `PLL_USB2`) |
+
+**Example: GPIO8 access (correct)**:
+```rust
+use imxrt_ral as ral;
+
+let gpio8 = unsafe { ral::gpio::GPIO8::instance() };
+ral::modify_reg!(ral::gpio, gpio8, GDIR, |v| v | (1 << 26));
+ral::write_reg!(ral::gpio, gpio8, DR_SET, 1 << 26);
+```
+
+**Example: IOMUXC access (correct)**:
+```rust
+let iomuxc = unsafe { ral::iomuxc::IOMUXC::instance() };
+ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_EMC_40, 5);  // ALT5
+ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_EMC_40, 0x0008);
+```
+
+**When raw access is acceptable**:
+- Debug readback of registers owned by a driver (e.g., USB2 registers after host controller consumes the instance)
+- Always document why raw access is necessary in a comment
+
+**Finding register names**:
+- `imxrt-ral` SVDs: `../imxrt-ral/svd/imxrt1062.svd`
+- `imxrt-ral` generated blocks: `../imxrt-ral/src/blocks/imxrt1061/` (1061/1062 share most blocks)
+- Reference manual chapters for register descriptions
+
 ## Risk Mitigation
 
 ### ~~Risk: `PERIODICLISTBASE`/`DEVICEADDR` Register Aliasing~~ ✅ Resolved
@@ -344,7 +390,7 @@ See [imxrt-usbd-reuse-analysis.md](planning/imxrt-usbd-reuse-analysis.md) for fu
 
 | Phase | Description | Duration | Key Milestone |
 |-------|-------------|----------|---------------|
-| Phase 1 | Foundation and initialization | 2-3 days | Controller in host mode, no faults |
+| **Phase 1** | **Foundation and initialization** | **2-3 days** | **✅ Controller in host mode, device detected** |
 | Phase 2a | Device detect + port reset + control transfers | 3-4 days | `GET_DESCRIPTOR` works ✨ |
 | Phase 2b | Bulk transfers | 2-3 days | USB flash drive sector read |
 | Phase 2c | Interrupt pipes | 2-3 days | HID keyboard input received |
@@ -412,6 +458,6 @@ Phase-specific open questions have been moved to their respective phase document
 
 ---
 
-**Document Version**: 2.0  
-**Date**: 2026-02-06  
-**Status**: Planning Phase — Pre-implementation
+**Document Version**: 3.0  
+**Date**: 2026-02-08  
+**Status**: Phase 1 COMPLETE — Device detection confirmed (low-speed keyboard via external 5V)

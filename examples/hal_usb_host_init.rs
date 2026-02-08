@@ -8,9 +8,10 @@
 //!
 //! 1. Sets up console logging over USB1 (CDC serial).
 //! 2. Enables the USB2 PLL (`PLL_USB2` — 480 MHz) for the host controller.
-//! 3. Constructs the USB host controller from USB2/USBPHY2 peripherals.
-//! 4. Calls `init()` to perform the full EHCI initialisation sequence.
-//! 5. Blinks the LED to indicate success.
+//! 3. Enables VBUS power on the USB2 host port (GPIO_EMC_40 → HIGH).
+//! 4. Constructs the USB host controller from USB2/USBPHY2 peripherals.
+//! 5. Calls `init()` to perform the full EHCI initialisation sequence.
+//! 6. Blinks the LED to indicate success.
 //!
 //! Connect a serial monitor to the Teensy's USB port to see the log messages.
 
@@ -125,6 +126,80 @@ fn enable_usb2_pll() {
 }
 
 // ---------------------------------------------------------------------------
+// USB2 register debug readback
+// ---------------------------------------------------------------------------
+
+/// USB OTG2 register block base address.
+///
+/// We use raw pointer access for USB2 debug reads because the USB2 RAL instance
+/// is owned by the host controller after init. This is debug-only code.
+const USB2_BASE: u32 = 0x402E_0200;
+
+/// Read a USB2 register by raw pointer.
+///
+/// We use raw pointer access instead of the RAL because the USB2 instance is
+/// owned by the host controller. This is only for debug register dumps.
+unsafe fn usb2_reg(offset: usize) -> u32 {
+    core::ptr::read_volatile((USB2_BASE as *const u8).add(offset) as *const u32)
+}
+
+// Register offsets within the USB OTG register block.
+// (Derived from the `RegisterBlock` layout in src/ral/usb.rs.)
+const OFF_USBCMD: usize        = 0x140;
+const OFF_USBSTS: usize        = 0x144;
+const OFF_USBINTR: usize       = 0x148;
+const OFF_PORTSC1: usize       = 0x184;
+const OFF_USBMODE: usize       = 0x1A8;
+const OFF_ASYNCLISTADDR: usize = 0x158;
+
+/// Log the key EHCI registers for debugging.
+unsafe fn dump_usb2_registers() {
+    let usbcmd  = usb2_reg(OFF_USBCMD);
+    let usbsts  = usb2_reg(OFF_USBSTS);
+    let usbintr = usb2_reg(OFF_USBINTR);
+    let portsc  = usb2_reg(OFF_PORTSC1);
+    let usbmode = usb2_reg(OFF_USBMODE);
+    let asynclist = usb2_reg(OFF_ASYNCLISTADDR);
+
+    log::info!("--- USB2 register dump ---");
+    log::info!("  USBCMD        = {:#010X}", usbcmd);
+    log::info!("    RS={} ASE={} PSE={} IAA={} ITC={}",
+        usbcmd & 1, (usbcmd >> 5) & 1, (usbcmd >> 4) & 1,
+        (usbcmd >> 6) & 1, (usbcmd >> 16) & 0xFF);
+    log::info!("  USBSTS        = {:#010X}", usbsts);
+    log::info!("    HCH={} PCI={} SEI={} AAI={} UI={} UEI={}",
+        (usbsts >> 12) & 1, (usbsts >> 2) & 1, (usbsts >> 4) & 1,
+        (usbsts >> 5) & 1, usbsts & 1, (usbsts >> 1) & 1);
+    log::info!("  USBINTR       = {:#010X}", usbintr);
+    log::info!("  PORTSC1       = {:#010X}", portsc);
+    log_portsc(portsc);
+    log::info!("  USBMODE       = {:#010X}  (CM={})", usbmode, usbmode & 3);
+    log::info!("  ASYNCLISTADDR = {:#010X}", asynclist);
+    log::info!("--- end register dump ---");
+}
+
+/// Decode and log PORTSC1 fields.
+fn log_portsc(portsc: u32) {
+    let ccs  = portsc & 1;           // Current Connect Status
+    let csc  = (portsc >> 1) & 1;    // Connect Status Change
+    let pe   = (portsc >> 2) & 1;    // Port Enabled
+    let pec  = (portsc >> 3) & 1;    // Port Enable Change
+    let pp   = (portsc >> 12) & 1;   // Port Power
+    let pr   = (portsc >> 8) & 1;    // Port Reset
+    let susp = (portsc >> 7) & 1;    // Suspend
+    let pspd = (portsc >> 26) & 3;   // Port Speed
+    let speed_str = match pspd {
+        0 => "Full (12M)",
+        1 => "Low (1.5M)",
+        2 => "High (480M)",
+        3 => "Not connected",
+        _ => "??",
+    };
+    log::info!("    CCS={} CSC={} PE={} PEC={} PP={} PR={} SUSP={} PSPD={} ({})",
+        ccs, csc, pe, pec, pp, pr, susp, pspd, speed_str);
+}
+
+// ---------------------------------------------------------------------------
 // Static resources for the USB host controller
 // ---------------------------------------------------------------------------
 
@@ -166,9 +241,9 @@ fn main() -> ! {
     let dma_a = dma[board::BOARD_DMA_A_INDEX].take().unwrap();
     let mut poller = board::logging::init(FRONTEND, BACKEND, console, dma_a, usbd);
 
-    // Give the USB CDC serial a moment to enumerate so the host PC can
+    // Give the USB CDC serial time to enumerate so the host PC can
     // connect a serial monitor before we start printing.
-    let startup_delay = board::PIT_FREQUENCY / 1_000 * 2_000; // 2 seconds
+    let startup_delay = board::PIT_FREQUENCY / 1_000 * 5_000; // 5 seconds
     blink_timer.set_load_timer_value(startup_delay);
     blink_timer.set_interrupt_enable(false);
     blink_timer.enable();
@@ -178,21 +253,87 @@ fn main() -> ! {
     blink_timer.clear_elapsed();
     blink_timer.disable();
 
+    // Helper: flush the log buffer by polling USB CDC for a fixed duration.
+    // The logging backend uses a 1024-byte bbqueue ring buffer that can only
+    // send ~512 bytes per poll() call (one USB packet). If we log faster than
+    // poll() can drain, writes are silently dropped. This helper busy-loops
+    // for `ms` milliseconds, giving the USB stack time to transfer everything.
+    let flush_log = |poller: &mut board::logging::Poller, timer: &mut _, ms: u32| {
+        use hal::pit::Pit;
+        let ticks = board::PIT_FREQUENCY / 1_000 * ms;
+        Pit::set_load_timer_value(timer, ticks);
+        Pit::set_interrupt_enable(timer, false);
+        Pit::enable(timer);
+        while !Pit::is_elapsed(timer) {
+            poller.poll();
+        }
+        Pit::clear_elapsed(timer);
+        Pit::disable(timer);
+    };
+
     log::info!("=== imxrt-usbh: USB Host Init Example ===");
+    log::info!("=== Build version 1.06 ===");
     log::info!("Board initialised, logging over USB CDC serial");
+    flush_log(&mut poller, &mut blink_timer, 50);
 
     // ---- Step 1: Enable USB2 PLL ----
     enable_usb2_pll();
+    flush_log(&mut poller, &mut blink_timer, 50);
 
-    // ---- Step 2: Acquire USB2 peripherals ----
+    // ---- Step 2: Enable VBUS power (Teensy 4.1) ----
+    //
+    // The Teensy 4.1 USB2 host port has an on-board load switch that gates 5V
+    // to the USB connector. The switch is controlled by GPIO_EMC_40 (ALT5 =
+    // GPIO3_IO26 / fast GPIO8_IO26). We must drive it HIGH to supply VBUS power.
+    //
+    // Without this, the connected device receives no power at all.
+    //
+    // Reference: USBHost_t36 ehci.cpp lines 209-212 (uses GPIO8, the fast bank).
+    log::info!("Enabling VBUS power (GPIO_EMC_40 → HIGH)...");
+    
+    // IOMUXC pad mux: GPIO_EMC_40 → ALT5 (GPIO3_IO26 / GPIO8_IO26)
+    let iomuxc = unsafe { ral::iomuxc::IOMUXC::instance() };
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_EMC_40, 5);
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_EMC_40, 0x0008);  // slow slew, weak drive
+    
+    // Enable fast GPIO routing for GPIO3→GPIO8.
+    // IOMUXC_GPR_GPR27 controls which bank drives GPIO3 pins: each bit selects
+    // between the regular GPIO3 bank (0) and the fast GPIO8 bank (1).
+    // Teensyduino's startup code sets this to 0xFFFFFFFF; without it, GPIO8
+    // writes have no effect on the physical pin.
+    let iomuxc_gpr = unsafe { ral::iomuxc_gpr::IOMUXC_GPR::instance() };
+    ral::modify_reg!(ral::iomuxc_gpr, iomuxc_gpr, GPR27, |v| v | (1 << 26));
+    
+    // Use the RAL for GPIO8 — type-safe access with correct base address (0x4200_8000)
+    let gpio8 = unsafe { ral::gpio::GPIO8::instance() };
+    ral::modify_reg!(ral::gpio, gpio8, GDIR, |v| v | (1 << 26));  // bit 26 = output
+    ral::write_reg!(ral::gpio, gpio8, DR_SET, 1 << 26);           // drive HIGH
+    
+    // Readback verification — confirm the writes took effect
+    let mux_readback = ral::read_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_EMC_40);
+    let pad_readback = ral::read_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_EMC_40);
+    let gpr27_readback = ral::read_reg!(ral::iomuxc_gpr, iomuxc_gpr, GPR27);
+    let gdir_readback = ral::read_reg!(ral::gpio, gpio8, GDIR);
+    let dr_readback = ral::read_reg!(ral::gpio, gpio8, DR);
+    log::info!("  IOMUXC MUX  = {:#010X} (expect 5)", mux_readback);
+    log::info!("  IOMUXC PAD  = {:#010X} (expect 0x0008)", pad_readback);
+    log::info!("  GPR27       = {:#010X} (bit 26 routes GPIO3→GPIO8)", gpr27_readback);
+    log::info!("  GPIO8 GDIR  = {:#010X} (bit 26 = {:#010X})", gdir_readback, 1u32 << 26);
+    log::info!("  GPIO8 DR    = {:#010X} (bit 26 = {:#010X})", dr_readback, 1u32 << 26);
+    
+    log::info!("VBUS power enabled");
+    flush_log(&mut poller, &mut blink_timer, 50);
+
+    // ---- Step 3: Acquire USB2 peripherals ----
     log::info!("Acquiring USB2 and USBPHY2 peripheral instances...");
     let peripherals = Usb2Peripherals {
         usb: unsafe { ral::usb::USB2::instance() },
         usbphy: unsafe { ral::usbphy::USBPHY2::instance() },
     };
 
-    // ---- Step 3: Construct the host controller ----
+    // ---- Step 4: Construct the host controller ----
     log::info!("Constructing USB host controller...");
+    flush_log(&mut poller, &mut blink_timer, 50);
     let statics: &'static UsbStatics = unsafe { &*core::ptr::addr_of!(STATICS) };
     let mut host = imxrt_usbh::host::Imxrt1062HostController::new(
         peripherals,
@@ -200,7 +341,7 @@ fn main() -> ! {
         statics,
     );
 
-    // ---- Step 4: Initialise the hardware ----
+    // ---- Step 5: Initialise the hardware ----
     log::info!("Initialising EHCI host controller...");
     log::info!("  - PHY reset and power-up");
     log::info!("  - Controller reset");
@@ -209,20 +350,76 @@ fn main() -> ! {
     log::info!("  - Enable interrupts and run controller");
     unsafe { host.init() };
     log::info!("USB host controller initialised successfully!");
+    flush_log(&mut poller, &mut blink_timer, 50);
 
-    // ---- Step 5: Blink LED to indicate success ----
+    // ---- Step 5b: Dump registers to verify init ----
+    unsafe { dump_usb2_registers() };
+    flush_log(&mut poller, &mut blink_timer, 50);
+
+    // Log DMA structure alignment for sanity check.
+    let sentinel_addr = &statics.qh_pool[0] as *const _ as u32;
+    let frame_list_addr = &statics.frame_list as *const _ as u32;
+    log::info!("Sentinel QH addr  = {:#010X} (64B-aligned: {})",
+        sentinel_addr, sentinel_addr % 64 == 0);
+    log::info!("Frame list addr   = {:#010X} (4096B-aligned: {})",
+        frame_list_addr, frame_list_addr % 4096 == 0);
+    flush_log(&mut poller, &mut blink_timer, 50);
+
+    // ---- Step 6: Blink LED + poll PORTSC1 for connect/disconnect ----
+    log::info!("Entering main loop — polling PORTSC1 for device events");
     log::info!("Blinking LED at 4 Hz to indicate success");
     blink_timer.set_load_timer_value(BLINK_INTERVAL);
     blink_timer.set_interrupt_enable(false);
     blink_timer.enable();
 
+    // Track previous connect status so we only log transitions.
+    let mut prev_ccs: u32 = 0;
+
     loop {
         poller.poll();
+
+        // Check PORTSC1 for connect/disconnect events.
+        let portsc = unsafe { usb2_reg(OFF_PORTSC1) };
+        let ccs = portsc & 1; // Current Connect Status
+        let csc = (portsc >> 1) & 1; // Connect Status Change (W1C)
+
+        if csc != 0 {
+            // Clear the Connect Status Change bit (W1C) — write 1 to bit 1
+            // while writing 0 to all other W1C bits to avoid clearing them.
+            // W1C bits in PORTSC1: CSC(1), PEC(3), OCC(5), FPR(6).
+            // We must also preserve the non-W1C bits, so we read, mask off
+            // all W1C bits, then set only CSC.
+            //
+            // Note: Using raw pointer because USB2 instance is owned by host controller.
+            let w1c_mask: u32 = (1 << 1) | (1 << 3) | (1 << 5) | (1 << 6);
+            let clear_val = (portsc & !w1c_mask) | (1 << 1); // set CSC only
+            unsafe {
+                core::ptr::write_volatile(
+                    (USB2_BASE as *mut u8).add(OFF_PORTSC1) as *mut u32,
+                    clear_val,
+                );
+            }
+        }
+
+        if ccs != prev_ccs {
+            if ccs != 0 {
+                log::info!(">>> DEVICE CONNECTED <<<");
+                log_portsc(portsc);
+                // Full register dump on connect for debugging.
+                unsafe { dump_usb2_registers() };
+            } else {
+                log::info!(">>> DEVICE DISCONNECTED <<<");
+                log_portsc(portsc);
+            }
+            prev_ccs = ccs;
+        }
+
         if blink_timer.is_elapsed() {
             while blink_timer.is_elapsed() {
                 blink_timer.clear_elapsed();
             }
             led.toggle();
+            //log::info!("Toggle LED");
         }
     }
 }

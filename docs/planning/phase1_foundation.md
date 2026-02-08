@@ -1,7 +1,29 @@
-# Phase 1: Foundation and Hardware Initialization
+# Phase 1: Foundation and Hardware Initialization ✅ COMPLETE
 
 **Estimated effort**: 2-3 days  
-**Key milestone**: Controller in host mode, no faults
+**Key milestone**: Controller in host mode, no faults  
+**Status**: ✅ COMPLETE (2026-02-08) — Device detection confirmed with external 5V power
+
+### Milestone Evidence
+
+With external 5V power supplied to the USB device, the EHCI host controller
+successfully detects a low-speed keyboard:
+
+```
+>>> DEVICE CONNECTED <<<
+    CCS=1 CSC=1 PE=0 PEC=0 PP=1 PR=0 SUSP=0 PSPD=1 (Low (1.5M))
+```
+
+Post-connect register state confirms healthy controller operation:
+- `USBCMD = 0x00018B15` — RS=1 (running), PSE=1, ITC=1
+- `USBSTS = 0x0000408C` — HCH=0 (not halted), PCI=1 (port change), SEI=0 (no errors)
+- `PORTSC1 = 0x14001401` — CCS=1, PP=1, PSPD=1 (low-speed)
+- `USBMODE = 0x00000003` — CM=3 (host mode)
+- `ASYNCLISTADDR = 0x20201200` — valid, 64-byte aligned sentinel QH
+
+**Note**: VBUS GPIO power control via GPIO_EMC_40 is deferred (registers correct
+but pin not driving the load switch). Development continues with external 5V.
+See [phase1_debugging.md](phase1_debugging.md) for full debugging history.
 
 ## 1.1 Register Access Setup ✅ DONE
 
