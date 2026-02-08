@@ -136,26 +136,59 @@ All `#[repr(C)]` with compile-time size/alignment assertions:
 5. **DTCM vs OCRAM**: Deferred. Starting with regular RAM + cache management. Can switch to DTCM
    (non-cached) placement later if cache coherency bugs are persistent (see Open Question 1).
 
-## 1.3 Initialization Sequence
+## 1.3 Initialization Sequence ✅ DONE
 
-- [ ] Implement `Imxrt1062HostController::new(usb, usbphy, shared, statics)` function
+- [x] Implement `Imxrt1062HostController::init()` method (hardware initialisation)
 
-Detailed initialization steps (order matters):
+The `init()` method is separate from `new()` — construction only stores references,
+`init()` performs the actual hardware register writes. Implemented in `src/host.rs`.
 
-1. **Enable USB clocks** — CCM clock gating for USB OTG2 and USBPHY2
-   - Note: May need to be done by the caller (BSP/board crate) before constructing the host controller
-   - USB PLL (PLL3, 480 MHz) must be enabled and stable
-2. **Reset USBPHY2** — Write `CTRL_SET` to assert `SFTRST`, then `CTRL_CLR` to release `SFTRST` and `CLKGATE`
-3. **Power on USBPHY2** — Write `PWD_CLR = 0xFFFF_FFFF` to enable all PHY sections
-4. **Reset USB controller** — Set `USBCMD[RST]`, wait for it to self-clear
-5. **Set host mode** — Write `USBMODE[CM] = 0b11` (host mode). **Must be done immediately after reset, before any other USBCMD writes** (per NXP errata)
-6. **Initialize async schedule** — Set up a dummy/sentinel QH that points to itself (circular list), write its physical address to `ASYNCLISTADDR`
-7. **Initialize periodic schedule** — Zero out the frame list (all entries = T-bit/terminate), write frame list base via `DEVICEADDR::BASEADR` field (host-mode alias for `PERIODICLISTBASE`), set frame list size in `USBCMD[FS]`
-8. **Configure interrupts** — Write `USBINTR` to enable: Port Change Detect (PCI), USB Interrupt (USBINT), USB Error Interrupt (USBERRINT), Async Advance (AAI)
-9. **Unmask NVIC interrupt** — Enable `USB_OTG2` (IRQ #112) in the NVIC
-10. **Enable controller** — Set `USBCMD[RS]` (Run/Stop = Run)
-11. **Enable port power** — Set `PORTSC1[PP]` (Port Power) if not already set
-12. **Enable VBUS** — Board-specific: Teensy 4.1 USB2 host port may need GPIO to enable VBUS supply
+### Init Sequence (as implemented)
+
+| Step | What | Register(s) | Notes |
+|------|------|-------------|-------|
+| 1 | PHY soft-reset | `CTRL_SET` (SFTRST), `CTRL_CLR` (SFTRST + CLKGATE) | SET/CLR avoids RMW race |
+| 2 | PHY UTMI levels | `CTRL_SET` (ENUTMILEVEL2, ENUTMILEVEL3) | Required for LS through HS hub |
+| 3 | PHY power-up | `PWD = 0` | Clears all power-down bits |
+| 4 | Controller reset | `USBCMD` RST → spin | RST is self-clearing |
+| 5 | Host mode | `USBMODE` CM=0b11 | **Must be immediately after reset** (NXP errata) |
+| 6 | Bus config | `SBUSCFG` AHBBRST=0b001 | INCR4 burst (matches USBHost_t36) |
+| 7 | Async schedule | `init_sentinel()` → `ASYNCLISTADDR` | Sentinel QH at qh_pool[0] |
+| 8 | Periodic schedule | `DEVICEADDR` (frame list addr), `FRINDEX=0` | DEVICEADDR aliases PERIODICLISTBASE |
+| 9 | Clear status | `USBINTR=0`, W1C `USBSTS` | Prevent spurious IRQs during init |
+| 10 | USBCMD | RS + PSE + ITC(1) + FS(32) + ASP(3) + ASPE | ASE deferred until first pipe added |
+| 11 | Port power | `PORTSC1` PP=1 | Root port power enable |
+| 12 | PHY disconnect detect | `CTRL_SET` ENHOSTDISCONDETECT | Needed for unplug detection |
+| 13 | Interrupts | `USBINTR`: UE, UEE, PCE, SEE, AAE, UAIE, UPIE | GP timer IRQs enabled on demand |
+
+### Design Decisions
+
+6. **ASE deferred**: The async schedule enable (ASE) bit is NOT set during init. Running the async
+   schedule with only the sentinel QH wastes bus bandwidth. ASE will be enabled when the first
+   endpoint pipe is added in phase 2.
+
+7. **USBCMD written once**: Rather than using modify_reg! to set individual fields (which would
+   trigger the controller between writes), USBCMD is written as a single word with all fields
+   (RS, PSE, ITC, FS, ASP, ASPE) set atomically.
+
+8. **ENHOSTDISCONDETECT**: The PHY's high-speed disconnect detector is enabled after the controller
+   starts. This is needed for the host to detect device unplugging (USBHost_t36 enables it in its
+   ISR on connect, but enabling at init is simpler and safe since no device is connected yet).
+
+9. **Prerequisites are caller responsibility**: USB PLL (CCM_ANALOG_PLL_USB2), clock gating
+   (CCM_CCGR6), VBUS GPIO (Teensy 4.1 GPIO_EMC_40), and NVIC enable for USB_OTG2 (IRQ #112)
+   must be done by the BSP/board crate before calling `init()`.
+
+### Differences from USBHost_t36
+
+- USBHost_t36 sets `ASYNCLISTADDR = 0` initially; we set it to the sentinel QH address immediately.
+  Both are valid — USBHost_t36 writes the address later when the first device connects.
+- USBHost_t36 enables GP Timer interrupts (TIE0, TIE1) at init; we defer them until timers are
+  actually started (reduces spurious timer IRQs).
+- USBHost_t36 writes the PLL setup inline; we require the caller to do it (cleaner separation).
+
+**Files modified** (verified compiling with `cargo check --target thumbv7em-none-eabihf`):
+- [x] `src/host.rs` — Added `init()` method (~110 lines) to `Imxrt1062HostController`
 
 ## Reference Materials
 
@@ -167,7 +200,10 @@ Detailed initialization steps (order matters):
 ## Open Questions
 
 1. **Q**: Should we use DTCM or regular OCRAM for QH/qTD structures?
-   **A**: TBD — DTCM avoids cache issues but is limited. Start with OCRAM + cache management. Profile and switch if cache bugs are persistent. **Decision point**: Phase 1.3 or later.
+   **A**: TBD — Starting with regular RAM + cache management (OCRAM). DTCM avoids cache issues
+   but is limited (512 KB shared with stack/data). Will switch to DTCM if cache coherency bugs
+   are persistent. No cache maintenance calls needed during init (structures are written before
+   DMA starts). **Decision deferred to Phase 2 testing.**
 
 2. **Q**: ~~How many QH/qTD should we pre-allocate?~~
    **A**: ✅ **Resolved.** Using **NUM_QH=4 QH + 1 sentinel = 5 QH slots**, **NUM_QTD=16 qTD slots**.

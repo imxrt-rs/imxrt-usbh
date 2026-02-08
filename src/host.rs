@@ -310,4 +310,180 @@ impl Imxrt1062HostController {
     pub(crate) fn statics(&self) -> &'static UsbStatics {
         self.statics
     }
+
+    // -----------------------------------------------------------------------
+    // Initialization
+    // -----------------------------------------------------------------------
+
+    /// Initialise the USB host controller hardware.
+    ///
+    /// This performs the full EHCI initialisation sequence for the i.MX RT 1062
+    /// USB OTG2 controller in host mode. The sequence is derived from the NXP
+    /// reference manual, USBHost_t36, and TinyUSB, adapted for this crate's
+    /// EHCI data structures.
+    ///
+    /// # Prerequisites
+    ///
+    /// The caller (BSP / board crate) **must** have already:
+    /// 1. Enabled the USB2 PLL (`CCM_ANALOG_PLL_USB2`) and waited for lock.
+    /// 2. Un-gated the USB OTG2 clock (`CCM_CCGR6_USBOH3`).
+    /// 3. Configured the VBUS power GPIO (Teensy 4.1: `GPIO_EMC_40`).
+    ///
+    /// # Sequence
+    ///
+    /// 1. Reset & power-on USB PHY
+    /// 2. Reset USB controller
+    /// 3. Set host mode (must be immediately after reset — NXP errata)
+    /// 4. Configure system bus interface (SBUSCFG)
+    /// 5. Initialise async schedule (sentinel QH → ASYNCLISTADDR)
+    /// 6. Initialise periodic schedule (frame list → PERIODICLISTBASE)
+    /// 7. Disable all interrupts, clear pending status
+    /// 8. Configure USBCMD (ITC, frame list size, async park, periodic schedule)
+    /// 9. Enable controller (Run)
+    /// 10. Enable port power
+    /// 11. Enable host disconnect detection in PHY
+    /// 12. Enable interrupts
+    ///
+    /// # Safety
+    ///
+    /// - Must be called exactly once after construction.
+    /// - The `UsbStatics` referenced by this controller must be in a `static`
+    ///   with stable addresses (required for DMA).
+    /// - Interrupts for USB OTG2 should be disabled (or not yet enabled in the
+    ///   NVIC) when this is called.
+    pub unsafe fn init(&mut self) {
+        // ---- Step 1: Reset and power-on USB PHY ----
+        //
+        // Assert soft-reset (clears PWD, TX, RX, CTRL to defaults).
+        ral::write_reg!(ral::usbphy, self.usbphy, CTRL_SET, SFTRST: 1);
+
+        // De-assert soft-reset and un-gate UTMI clocks.
+        // Using CTRL_CLR (write-1-to-clear) avoids a read-modify-write race.
+        ral::write_reg!(ral::usbphy, self.usbphy, CTRL_CLR, SFTRST: 1, CLKGATE: 1);
+
+        // Enable UTMI+ Level 2 and Level 3 (required for low-speed device support
+        // through a high-speed hub, per USB 2.0 §11.8).
+        ral::write_reg!(ral::usbphy, self.usbphy, CTRL_SET, ENUTMILEVEL2: 1, ENUTMILEVEL3: 1);
+
+        // Power up the PHY — writing 0 clears all power-down bits in PWD.
+        ral::write_reg!(ral::usbphy, self.usbphy, PWD, 0);
+
+        // ---- Step 2: Reset USB controller ----
+        //
+        // Assert controller reset. RST is self-clearing.
+        ral::modify_reg!(ral::usb, self.usb, USBCMD, |cmd| cmd | (1 << 1));
+
+        // Spin until the controller completes reset (RST self-clears to 0).
+        while ral::read_reg!(ral::usb, self.usb, USBCMD, RST == 1) {}
+
+        // ---- Step 3: Set host mode (immediately after reset) ----
+        //
+        // Per NXP errata, USBMODE must be written immediately after the controller
+        // reset completes, before any other USBCMD writes. CM=0b11 = Host Controller.
+        ral::write_reg!(ral::usb, self.usb, USBMODE, CM: 0b11);
+
+        // ---- Step 4: Configure system bus interface ----
+        //
+        // SBUSCFG = INCR4 burst then single transfer. This matches USBHost_t36's
+        // SBUSCFG=1 setting and provides good AHB bus utilisation.
+        ral::write_reg!(ral::usb, self.usb, SBUSCFG, AHBBRST: 0b001);
+
+        // ---- Step 5: Initialise async schedule ----
+        //
+        // Set up the sentinel QH (index 0) as a self-referencing circular list.
+        // This is the idle state of the async schedule per EHCI §4.8.
+        let sentinel = &self.statics.qh_pool[0] as *const _ as *mut crate::ehci::QueueHead;
+        unsafe { (*sentinel).init_sentinel() };
+
+        // Write the sentinel's physical address to ASYNCLISTADDR.
+        let sentinel_addr = sentinel as u32;
+        ral::write_reg!(ral::usb, self.usb, ASYNCLISTADDR, sentinel_addr);
+
+        // ---- Step 6: Initialise periodic schedule ----
+        //
+        // The frame list is already zeroed (all entries = terminate) from
+        // FrameList::new(). Write the frame list base address.
+        //
+        // DEVICEADDR and PERIODICLISTBASE share the same register offset.
+        // In host mode, bits 31:12 (BASEADR) hold the periodic frame list
+        // base address.
+        let frame_list_addr = &self.statics.frame_list as *const _ as u32;
+        ral::write_reg!(ral::usb, self.usb, DEVICEADDR, frame_list_addr);
+
+        // Reset the frame index to 0.
+        ral::write_reg!(ral::usb, self.usb, FRINDEX, 0);
+
+        // ---- Step 7: Disable interrupts and clear pending status ----
+        //
+        // Ensure no spurious interrupts fire during init.
+        ral::write_reg!(ral::usb, self.usb, USBINTR, 0);
+
+        // Clear all pending status bits by reading and writing back (W1C).
+        let status = ral::read_reg!(ral::usb, self.usb, USBSTS);
+        ral::write_reg!(ral::usb, self.usb, USBSTS, status);
+
+        // ---- Step 8: Configure and start the controller (USBCMD) ----
+        //
+        // Build the USBCMD value:
+        //
+        //   ITC  = 1 micro-frame (125μs interrupt coalescing)
+        //   FS   = 32-entry frame list (FS_2=1, FS_1=0b01)
+        //   PSE  = 1 (enable periodic schedule)
+        //   ASP  = 0b11 (async schedule park count = 3 — max service transactions)
+        //   ASPE = 1 (enable async schedule park mode)
+        //   RS   = 1 (run)
+        //
+        // Frame list size encoding for 32 entries:
+        //   FS[2:0] = 0b101 → FS_2 (bit 15) = 1, FS_1 (bits 3:2) = 0b01
+        //
+        // Note: ASE (async schedule enable) is NOT set here. It will be enabled
+        // when the first endpoint pipe is added in phase 2, because running the
+        // async schedule with only a sentinel QH wastes bus bandwidth.
+        let usbcmd: u32 = (1 << 0)    // RS: Run
+            | (0b01 << 2)             // FS_1: frame list size low bits
+            | (1 << 4)               // PSE: periodic schedule enable
+            | (0b11 << 8)            // ASP: async park count = 3
+            | (1 << 11)              // ASPE: async park mode enable
+            | (1 << 15)              // FS_2: frame list size high bit
+            | (1 << 16);             // ITC: 1 micro-frame threshold
+        ral::write_reg!(ral::usb, self.usb, USBCMD, usbcmd);
+
+        // ---- Step 9: Enable port power ----
+        //
+        // PP (Port Power) must be set for the root port to supply power.
+        // Use modify to preserve other PORTSC1 bits.
+        ral::modify_reg!(ral::usb, self.usb, PORTSC1, PP: 1);
+
+        // ---- Step 10: Enable host disconnect detection in PHY ----
+        //
+        // ENHOSTDISCONDETECT enables the PHY's high-speed disconnect detector,
+        // which is needed for the host to detect when a device is unplugged.
+        ral::write_reg!(ral::usbphy, self.usbphy, CTRL_SET, ENHOSTDISCONDETECT: 1);
+
+        // ---- Step 11: Enable interrupts ----
+        //
+        // Enable the interrupt sources we care about:
+        //   PCE  (bit 2)  — Port Change Detect (connect/disconnect)
+        //   UE   (bit 0)  — USB Interrupt (transfer complete)
+        //   UEE  (bit 1)  — USB Error Interrupt (transfer error)
+        //   AAE  (bit 5)  — Async Advance (QH removal doorbell)
+        //   SEE  (bit 4)  — System Error (AHB bus error — should never happen)
+        //   UAIE (bit 18) — NXP async completion (finer-grained than UE)
+        //   UPIE (bit 19) — NXP periodic completion (finer-grained than UE)
+        //
+        // GP Timer interrupts (TIE0, TIE1) are NOT enabled here — they will be
+        // enabled on-demand when timers are started (e.g. port debounce in phase 2).
+        //
+        // The NVIC interrupt for USB_OTG2 (IRQ #112) must be enabled separately
+        // by the caller (typically via RTIC or cortex_m::peripheral::NVIC).
+        ral::write_reg!(ral::usb, self.usb, USBINTR,
+            UE: 1,    // USB Interrupt Enable
+            UEE: 1,   // USB Error Interrupt Enable
+            PCE: 1,   // Port Change Detect Enable
+            SEE: 1,   // System Error Enable
+            AAE: 1,   // Async Advance Enable
+            UAIE: 1,  // USB Host Async Interrupt Enable (NXP)
+            UPIE: 1   // USB Host Periodic Interrupt Enable (NXP)
+        );
+    }
 }
