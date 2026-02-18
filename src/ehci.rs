@@ -534,6 +534,20 @@ impl QueueHead {
         self.overlay_token.write(0);
     }
 
+    /// Re-attach a qTD to this QH after it completes (interrupt pipe re-arm).
+    ///
+    /// Unlike [`attach_qtd`], this does **not** clear `overlay_token`, preserving
+    /// the data toggle managed by the controller (`DTC = 0` mode). Used to
+    /// re-arm an interrupt endpoint after each received packet.
+    ///
+    /// # Safety
+    /// - `qtd` must point to a valid [`TransferDescriptor`] with Active=1.
+    /// - Cache must be cleaned after this call and before the controller reads the QH.
+    pub unsafe fn reattach_qtd_preserve_toggle(&mut self, qtd: *const TransferDescriptor) {
+        self.overlay_next.write(qtd as u32);
+        // overlay_token intentionally NOT written — controller manages DT bit (DTC=0)
+    }
+
     /// Link this QH into the async schedule after `prev`.
     ///
     /// Inserts `self` between `prev` and whatever `prev` currently points to.

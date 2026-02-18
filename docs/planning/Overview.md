@@ -7,6 +7,12 @@ USB host support to work with the `cotton-usb-host` crate (v0.2.1+). The impleme
 follows the pattern established by the RP2040 host controller implementation in 
 `cotton-usb-host::host::rp2040`.
 
+
+**Document Version**: 4.4
+**Date**: 2026-02-18
+**Status**: Phase 2b COMPLETE — HID keyboard key presses received correctly on hardware. Beginning Phase 2c.
+**Next Step**: Implement `bulk_in_transfer()` and `bulk_out_transfer()` in `src/host.rs`. Milestone: read a sector from a USB flash drive.
+
 ## Goals
 
 1. Implement the `HostController` trait from `cotton-usb-host` for i.MX RT 1060/1062
@@ -141,8 +147,8 @@ pub trait HostController {
 | Sub-phase | Scope | Milestone |
 |-----------|-------|-----------|
 | **2a** (3-4 days) | Device detection, port reset, control transfers | ✅ COMPLETE — Full USB enumeration working (VID=045e PID=00db) |
-| **2b** (2-3 days) | `bulk_in_transfer()`, `bulk_out_transfer()` | USB flash drive sector read |
-| **2c** (2-3 days) | `alloc_interrupt_pipe()`, `try_alloc_interrupt_pipe()` | HID keyboard input received |
+| **2b** (2-3 days) | `alloc_interrupt_pipe()`, `try_alloc_interrupt_pipe()` | ✅ COMPLETE — HID keyboard input received on hardware |
+| **2c** (2-3 days) | `bulk_in_transfer()`, `bulk_out_transfer()` | USB flash drive sector read |
 
 - Implement `Imxrt1062DeviceDetect` stream (PORTSC1 monitoring, speed detection)
 - Implement `reset_root_port()` with W1C-safe register writes
@@ -370,6 +376,50 @@ ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_EMC_40, 0x0008);
 - `imxrt-ral` generated blocks: `../imxrt-ral/src/blocks/imxrt1061/` (1061/1062 share most blocks)
 - Reference manual chapters for register descriptions
 
+## Build Tools
+
+### build_example.ps1
+
+A PowerShell helper script at the project root (`build_example.ps1`) builds an example,
+converts the ELF to a HEX file, and prints **only error lines** from cargo — keeping
+build output short when pasting results into the context window.
+
+**Usage**:
+```powershell
+# Basic — produces <example>.hex in the current directory
+.\build_example.ps1 -Example rtic_usb_enumerate
+
+# Custom output file name
+.\build_example.ps1 -Example rtic_usb_enumerate -HexFile usb_enumerate.hex
+```
+
+The script:
+1. Runs `cargo build --release --target thumbv7em-none-eabihf --example <name>`
+2. Filters stderr/stdout, keeping only `error[…]:` blocks (warnings suppressed)
+3. On success, runs `rust-objcopy -O ihex` to produce the HEX file
+4. Exits non-zero on any failure so CI / manual inspection is straightforward
+
+**Expected output on a clean build** (nothing to paste):
+```
+Building example 'rtic_usb_enumerate' -> 'rtic_usb_enumerate.hex' ...
+Build succeeded. Converting ELF to HEX ...
+Done: rtic_usb_enumerate.hex
+```
+
+**Expected output on a compiler error** (paste only this into context):
+```
+Building example 'rtic_usb_enumerate' -> 'rtic_usb_enumerate.hex' ...
+
+BUILD ERRORS:
+error[E0308]: mismatched types
+  --> src/host.rs:42:5
+   |
+42 |     return 0u32;
+   |     ^^^^^^^^^^^^ expected `()`, found `u32`
+
+Build FAILED for example 'rtic_usb_enumerate'.
+```
+
 ## Risk Mitigation
 
 ### ~~Risk: `PERIODICLISTBASE`/`DEVICEADDR` Register Aliasing~~ ✅ Resolved
@@ -386,7 +436,7 @@ ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_EMC_40, 0x0008);
 
 **Impact**: High — could significantly extend timeline
 **Mitigation**:
-- Build strictly incrementally: device detect → control → bulk → interrupt
+- Build strictly incrementally: device detect → control → interrupt → bulk
 - First milestone is `GET_DESCRIPTOR` — proves entire DMA pipeline
 - Use simplified periodic schedule initially
 - Reference TinyUSB (simple) and Linux (comprehensive) simultaneously
@@ -426,8 +476,8 @@ ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_EMC_40, 0x0008);
 |-------|-------------|----------|---------------|
 | **Phase 1** | **Foundation and initialization** | **2-3 days** | **✅ Controller in host mode, device detected** |
 | **Phase 2a** | **Device detect + port reset + control transfers** | **3-4 days** | **✅ COMPLETE — Full USB enumeration working (VID=045e PID=00db)** |
-| Phase 2b | Bulk transfers | 2-3 days | USB flash drive sector read |
-| Phase 2c | Interrupt pipes | 2-3 days | HID keyboard input received |
+| **Phase 2b** | **Interrupt pipes** | **2-3 days** | **✅ COMPLETE — HID keyboard reports received** |
+| Phase 2c | Bulk transfers | 2-3 days | USB flash drive sector read |
 | Phase 3 | Interrupts, async, cache polish | 2-3 days | Reliable operation, no corruption |
 | Phase 4 | Testing and examples | 3-5 days | All device types working |
 | Phase 5 | Documentation | 1-2 days | Complete docs and examples |
@@ -490,9 +540,4 @@ Phase-specific open questions have been moved to their respective phase document
 - Interrupt endpoint support is harder than bulk — the periodic schedule adds complexity
 - The disable-on-handle / re-enable-on-poll interrupt pattern (from RP2040 implementation) prevents IRQ storms and is critical for correct async waker behavior
 
----
 
-**Document Version**: 3.9
-**Date**: 2026-02-17
-**Status**: \u2705 Phase 2a COMPLETE \u2014 full USB enumeration working on hardware.
-**Latest**: Low-speed Microsoft keyboard (VID=045e PID=00db) successfully enumerated via cotton-usb-host UsbBus framework. Four bugs fixed during debugging: (1) QH horizontal_link cache flush, (2) NAK_RL=15, (3) alloc_qtd double-allocation, (4) ISR clearing USBSTS.AAI before AsyncAdvanceWait could read it. Next: Phase 2b (bulk transfers).

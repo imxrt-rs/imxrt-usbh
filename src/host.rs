@@ -238,7 +238,8 @@ pub struct UsbStatics {
     /// Pre-allocated Queue Head storage.
     ///
     /// Index 0 is reserved for the async schedule sentinel.
-    /// Indices 1..NUM_QH are for endpoint pipes.
+    /// Index 1 is reserved for the single control pipe (EP0).
+    /// Indices 2..=NUM_QH are for bulk/interrupt pipes (NUM_QH−1 slots).
     pub qh_pool: [QueueHead; NUM_QH + 1], // +1 for sentinel
 
     /// Pre-allocated Transfer Descriptor storage.
@@ -246,6 +247,13 @@ pub struct UsbStatics {
 
     /// Periodic frame list (4096-byte aligned).
     pub frame_list: FrameList,
+
+    /// Receive buffers for interrupt pipes.
+    ///
+    /// One 64-byte buffer per interrupt pipe slot. These live in a `static`
+    /// so their addresses are stable for the DMA engine. Index matches the
+    /// `bulk_pipes` pool token (0..NUM_QH-2).
+    pub recv_bufs: [[u8; 64]; NUM_QH - 1],
 }
 
 impl UsbStatics {
@@ -255,7 +263,8 @@ impl UsbStatics {
     pub const fn new() -> Self {
         Self {
             control_pipes: Pool::new(1),
-            bulk_pipes: Pool::new(NUM_QH as u8),
+            // NUM_QH - 1 slots: indices 2..=NUM_QH in qh_pool (index 0 = sentinel, 1 = control)
+            bulk_pipes: Pool::new((NUM_QH - 1) as u8),
             qh_pool: {
                 const QH: QueueHead = QueueHead::new();
                 [QH; NUM_QH + 1]
@@ -265,6 +274,7 @@ impl UsbStatics {
                 [QTD; NUM_QTD]
             },
             frame_list: FrameList::new(),
+            recv_bufs: [[0u8; 64]; NUM_QH - 1],
         }
     }
 }
@@ -739,6 +749,81 @@ impl Imxrt1062HostController {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Periodic schedule management
+    // -----------------------------------------------------------------------
+
+    /// Link a QH into the periodic schedule.
+    ///
+    /// Inserts `qh` at the head of the chain: all 32 frame list entries are
+    /// updated to point to `qh`, and `qh.horizontal_link` is set to whatever
+    /// the frame list entries previously pointed to (the old head, or TERMINATE).
+    ///
+    /// # Safety
+    /// - The QH must be fully initialized (characteristics, capabilities, qTD attached).
+    /// - Cache must be cleaned after this call.
+    unsafe fn link_qh_to_periodic_schedule(&self, qh: *mut QueueHead) {
+        // Read the current head from the first entry (all entries are kept in sync)
+        let old_head = self.statics.frame_list.entries[0].read();
+        // New QH → old head (or TERMINATE if list was empty)
+        (*qh).horizontal_link.write(old_head);
+        // All frame list entries → new QH (volatile write via raw pointer)
+        let new_link = ehci::link_pointer(qh as u32, ehci::link_type::QH);
+        let entries = self.statics.frame_list.entries.as_ptr() as *mut u32;
+        for i in 0..ehci::FRAME_LIST_LEN {
+            core::ptr::write_volatile(entries.add(i), new_link);
+        }
+    }
+
+    /// Unlink a QH from the periodic schedule.
+    ///
+    /// Finds all references to `qh` — either directly in the frame list entries
+    /// or via the `horizontal_link` of a predecessor QH — and replaces them with
+    /// `qh`'s own `horizontal_link` (its successor, or TERMINATE).
+    ///
+    /// # Safety
+    /// - `qh` must currently be in the periodic schedule.
+    /// - Cache must be cleaned after this call.
+    unsafe fn unlink_qh_from_periodic_schedule(
+        statics: &'static UsbStatics,
+        qh: *const QueueHead,
+    ) {
+        let target_addr = ehci::link_address(qh as u32);
+        let successor = (*qh).horizontal_link.read();
+
+        // Update any frame list entries that point directly to this QH (head case).
+        let entries = statics.frame_list.entries.as_ptr() as *mut u32;
+        for i in 0..ehci::FRAME_LIST_LEN {
+            let val = core::ptr::read_volatile(entries.add(i));
+            if ehci::link_address(val) == target_addr {
+                core::ptr::write_volatile(entries.add(i), successor);
+            }
+        }
+
+        // Walk the chain from the (possibly updated) first frame list entry to find
+        // any QH whose horizontal_link points to the target (mid-chain removal).
+        let head_link = statics.frame_list.entries[0].read();
+        if !ehci::link_is_terminate(head_link) {
+            let mut prev = ehci::link_address(head_link) as *mut QueueHead;
+            // Bound the walk to at most NUM_QH steps to guard against corruption.
+            for _ in 0..NUM_QH {
+                let next_link = (*prev).horizontal_link.read();
+                if ehci::link_is_terminate(next_link) {
+                    break;
+                }
+                if ehci::link_address(next_link) == target_addr {
+                    (*prev).horizontal_link.write(successor);
+                    break;
+                }
+                prev = ehci::link_address(next_link) as *mut QueueHead;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Async schedule management
+    // -----------------------------------------------------------------------
+
     /// Enable the async schedule if not already enabled.
     fn enable_async_schedule(&self) {
         let cmd = ral::read_reg!(ral::usb, self.usb, USBCMD);
@@ -1044,6 +1129,117 @@ impl Imxrt1062HostController {
 
         bytes_transferred
     }
+
+    // -----------------------------------------------------------------------
+    // Interrupt pipe implementation
+    // -----------------------------------------------------------------------
+
+    /// Set up and return an interrupt pipe for polling an IN endpoint.
+    ///
+    /// Called by both [`alloc_interrupt_pipe`] (after an async pool allocation)
+    /// and [`try_alloc_interrupt_pipe`] (after a synchronous try-alloc).
+    fn do_alloc_interrupt_pipe(
+        &self,
+        pipe: Pipe,
+        address: u8,
+        _transfer_extras: TransferExtras,
+        endpoint: u8,
+        max_packet_size: u16,
+        _interval_ms: u8,
+    ) -> Imxrt1062InterruptPipe {
+        // Map pipe slot to pool indices.
+        // bulk_pipes tokens are 0..NUM_QH-2; Pipe::new(pooled, 1) makes which=1..NUM_QH-1.
+        //   QH index  = pipe.which() as usize + 1  → qh_pool[2..=NUM_QH]
+        //   recv_buf  = pipe.which() as usize - 1  → recv_bufs[0..NUM_QH-2]
+        //   waker idx = pipe.which() as usize       → pipe_wakers[1..NUM_QH-1]
+        let qh_index = pipe.which() as usize + 1;
+        let recv_buf_idx = pipe.which() as usize - 1;
+
+        // Allocate a qTD for the receive buffer.
+        // We use a dedicated qTD for the lifetime of the pipe (one in-flight at a time).
+        let qtd_index = self.alloc_qtd().expect("qTD pool exhausted for interrupt pipe");
+
+        // Determine port speed.
+        let speed = match self.port_speed() {
+            0 => ehci::SPEED_FULL,
+            1 => ehci::SPEED_LOW,
+            _ => ehci::SPEED_HIGH,
+        };
+
+        // Build QH endpoint characteristics.
+        // DTC = 0 (hardware-managed data toggle in QH overlay) for non-control endpoints.
+        let characteristics = ehci::qh_characteristics(
+            address,
+            endpoint,
+            speed,
+            max_packet_size,
+            false, // not a control endpoint
+            false, // not head of reclamation list
+        );
+
+        // Build QH endpoint capabilities.
+        // S-mask = 0x01: poll in micro-frame 0 of each scheduled frame.
+        // C-mask = 0: no split-completion mask (not a split transaction).
+        // hub_addr/hub_port = 0: device is directly connected (no TT).
+        let capabilities = ehci::qh_capabilities(0x01, 0, 0, 0, 1);
+
+        // Initialise the QH.
+        let qh = unsafe { self.qh_mut(qh_index) };
+        unsafe { (*qh).init_endpoint(characteristics, capabilities) };
+
+        // Set up the initial qTD: PID=IN, Active, max_packet_size bytes, IOC.
+        let recv_buf_ptr = self.statics.recv_bufs[recv_buf_idx].as_ptr();
+        // DIAG Step 1: Confirm recv_buf is in DMA-accessible memory (OCRAM 0x2020_xxxx/0x2024_xxxx).
+        // If address is 0x2000_xxxx (DTCM), EHCI DMA cannot write there → always zeros.
+        log::info!(
+            "[HC] recv_buf[{}] @ 0x{:08x} (OCRAM=0x2020_0000..0x202F_FFFF, DTCM=0x2000_xxxx)",
+            recv_buf_idx,
+            recv_buf_ptr as u32,
+        );
+        let token = ehci::qtd_token(PID_IN, max_packet_size as u32, false, true);
+        let qtd = unsafe { self.qtd_mut(qtd_index) };
+        unsafe { (*qtd).init(token, recv_buf_ptr, max_packet_size as u32) };
+
+        // Attach qTD to QH (sets overlay_next, clears halt — OK for first attach).
+        unsafe { (*qh).attach_qtd(qtd) };
+
+        // Cache maintenance: clean qTD, recv_buf, QH, and frame list before linking.
+        Self::cache_clean_qtd(qtd);
+        Self::cache_clean_buffer(recv_buf_ptr, max_packet_size as usize);
+        Self::cache_clean_qh(qh);
+        cache::clean_invalidate_dcache_by_address(
+            self.statics.frame_list.entries.as_ptr() as usize,
+            core::mem::size_of::<ehci::FrameList>(),
+        );
+
+        // Insert QH at the head of the periodic schedule.
+        unsafe { self.link_qh_to_periodic_schedule(qh) };
+
+        // Cache-clean QH (horizontal_link changed) and frame list (all entries changed).
+        Self::cache_clean_qh(qh);
+        cache::clean_invalidate_dcache_by_address(
+            self.statics.frame_list.entries.as_ptr() as usize,
+            core::mem::size_of::<ehci::FrameList>(),
+        );
+
+        info!(
+            "[HC] interrupt pipe allocated: addr={} ep={} mps={} qh={} qtd={}",
+            address, endpoint, max_packet_size, qh_index, qtd_index
+        );
+
+        Imxrt1062InterruptPipe {
+            pipe,
+            qh_index,
+            qtd_index,
+            recv_buf_idx,
+            address,
+            endpoint,
+            max_packet_size,
+            statics: self.statics,
+            shared: self.shared,
+            usb: self.usb.addr as *const ral::usb::RegisterBlock,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1273,26 +1469,201 @@ impl Pipe {
 }
 
 // ---------------------------------------------------------------------------
-// Imxrt1062InterruptPipe — placeholder for phase 2c
+// Imxrt1062InterruptPipe — periodic schedule interrupt endpoint stream
 // ---------------------------------------------------------------------------
 
-/// Interrupt pipe stream for i.MX RT 1062 (placeholder for phase 2c).
+/// Interrupt IN pipe for i.MX RT 1062.
 ///
-/// Will be implemented in phase 2c to support interrupt endpoints.
+/// Wraps a single QH + qTD polling an interrupt IN endpoint via the EHCI
+/// periodic schedule. Implements `Stream<Item = InterruptPacket>` so callers
+/// can `await` the next packet with standard async combinators.
+///
+/// # Lifecycle
+///
+/// Created by [`Imxrt1062HostController::alloc_interrupt_pipe`] or
+/// [`try_alloc_interrupt_pipe`]. The pipe occupies one slot from the
+/// `bulk_pipes` pool and one slot from the `qtd_pool` for its entire lifetime.
+///
+/// On `Drop`, the QH is unlinked from the periodic frame list and the qTD
+/// slot is freed. A brief (~1 ms) busy-wait ensures the EHCI controller has
+/// crossed at least one frame boundary before resources are released.
 pub struct Imxrt1062InterruptPipe {
-    _marker: core::marker::PhantomData<()>,
+    /// Pool allocation (RAII — frees the `bulk_pipes` slot on Drop).
+    pipe: Pipe,
+    /// Index into `statics.qh_pool` for this pipe's QH.
+    qh_index: usize,
+    /// Index into `statics.qtd_pool` for this pipe's receive qTD.
+    qtd_index: usize,
+    /// Index into `statics.recv_bufs` for the DMA receive buffer.
+    recv_buf_idx: usize,
+    /// USB device address.
+    address: u8,
+    /// Endpoint number.
+    endpoint: u8,
+    /// Maximum packet size (used when re-arming the qTD).
+    max_packet_size: u16,
+    /// Static resource pools.
+    statics: &'static UsbStatics,
+    /// ISR ↔ async shared state.
+    shared: &'static UsbShared,
+    /// Raw pointer to the USB OTG register block (for re-enabling interrupts).
+    usb: *const ral::usb::RegisterBlock,
 }
 
 impl Stream for Imxrt1062InterruptPipe {
     type Item = InterruptPacket;
 
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // Placeholder — will be implemented in phase 2c
-        Poll::Pending
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // Register waker before checking status (race-free pattern).
+        self.shared
+            .pipe_waker(self.pipe.which() as usize)
+            .register(cx.waker());
+
+        // Invalidate cache to see any hardware updates to the qTD token.
+        let qtd = &self.statics.qtd_pool[self.qtd_index];
+        Imxrt1062HostController::cache_clean_qtd(qtd as *const TransferDescriptor);
+
+        let token = qtd.token.read();
+
+        if token & ehci::QTD_TOKEN_ACTIVE != 0 {
+            // Transfer still in progress — re-enable transfer interrupts and wait.
+            let usb_inst = ral::usb::Instance {
+                addr: self.usb as *mut _,
+            };
+            ral::modify_reg!(ral::usb, usb_inst, USBINTR, |v| v
+                | (1 << 0)   // UE
+                | (1 << 1)   // UEE
+                | (1 << 18)  // UAIE
+                | (1 << 19)  // UPIE
+            );
+            return Poll::Pending;
+        }
+
+        // --- Transfer complete (Active cleared by controller) ---
+
+        // Invalidate receive buffer cache before reading the data.
+        // Use invalidate-only (DCIMVAC), NOT clean+invalidate (DCCIMVAC),
+        // because for DMA receive buffers we must NOT write back any stale
+        // dirty cache lines — the RAM contents written by DMA are authoritative.
+        let recv_buf = &self.statics.recv_bufs[self.recv_buf_idx];
+        cache::invalidate_dcache_by_address(recv_buf.as_ptr() as usize, recv_buf.len());
+
+        // DIAG Step 2: Log raw qTD token and first 8 recv_buf bytes.
+        // H1 (DTCM): bytes always 00 even with key held.
+        // H3 (Error): token bit6=Halted or bit3=XACT_ERR, remaining=mps (0 bytes transferred).
+        // Working: token=0x0000_0000, remaining=0, non-zero bytes on key press.
+        log::info!(
+            "[HC] qTD done: token=0x{:08x} rem={} buf=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
+            token,
+            ehci::qtd_token_bytes_remaining(token),
+            recv_buf[0], recv_buf[1], recv_buf[2], recv_buf[3],
+            recv_buf[4], recv_buf[5], recv_buf[6], recv_buf[7],
+        );
+
+        // Compute how many bytes were actually received.
+        let remaining = ehci::qtd_token_bytes_remaining(token) as usize;
+        let received = (self.max_packet_size as usize).saturating_sub(remaining);
+        let copy_len = received.min(64);
+
+        // Build the InterruptPacket.
+        let mut packet = InterruptPacket::new();
+        packet.address = self.address;
+        packet.endpoint = self.endpoint;
+        packet.size = copy_len as u8;
+        packet.data[..copy_len].copy_from_slice(&recv_buf[..copy_len]);
+
+        // --- Re-arm the qTD for the next poll ---
+        //
+        // Fully re-initialise the qTD (token, buffer pointers, next/alt_next).
+        // This is necessary because the EHCI controller writes back the overlay
+        // area to the original qTD after completion, which advances buffer[0]'s
+        // current-offset field by the number of bytes received. If we only reset
+        // the token, subsequent transfers write to advancing addresses while we
+        // always read from the original recv_buf base. See phase2b_debugging.md.
+        //
+        // The data toggle is managed by the controller in the QH overlay (DTC=0),
+        // so we do NOT write overlay_token here — `reattach_qtd_preserve_toggle`
+        // only updates overlay_next, leaving the controller-managed toggle intact.
+        let rearm_token = ehci::qtd_token(PID_IN, self.max_packet_size as u32, false, true);
+        let qtd_ptr =
+            &self.statics.qtd_pool[self.qtd_index] as *const TransferDescriptor as *mut TransferDescriptor;
+        let qh_ptr =
+            &self.statics.qh_pool[self.qh_index] as *const QueueHead as *mut QueueHead;
+
+        unsafe {
+            (*qtd_ptr).init(rearm_token, recv_buf.as_ptr(), self.max_packet_size as u32);
+            (*qh_ptr).reattach_qtd_preserve_toggle(qtd_ptr);
+        }
+
+        // Flush both the qTD and QH back to RAM for the DMA engine.
+        Imxrt1062HostController::cache_clean_qtd(qtd_ptr);
+        Imxrt1062HostController::cache_clean_qh(qh_ptr);
+
+        // Re-enable transfer interrupts so the next completion wakes us.
+        let usb_inst = ral::usb::Instance {
+            addr: self.usb as *mut _,
+        };
+        ral::modify_reg!(ral::usb, usb_inst, USBINTR, |v| v
+            | (1 << 0)   // UE
+            | (1 << 1)   // UEE
+            | (1 << 18)  // UAIE
+            | (1 << 19)  // UPIE
+        );
+
+        Poll::Ready(Some(packet))
     }
 }
 
-impl Unpin for Imxrt1062InterruptPipe {}
+impl Drop for Imxrt1062InterruptPipe {
+    fn drop(&mut self) {
+        // 1. Remove the QH from the periodic frame list.
+        let qh_ptr =
+            &self.statics.qh_pool[self.qh_index] as *const QueueHead as *mut QueueHead;
+        unsafe {
+            Imxrt1062HostController::unlink_qh_from_periodic_schedule(self.statics, qh_ptr);
+        }
+
+        // Clean the frame list after modification.
+        cache::clean_invalidate_dcache_by_address(
+            self.statics.frame_list.entries.as_ptr() as usize,
+            core::mem::size_of::<ehci::FrameList>(),
+        );
+        // Clean any predecessor QHs whose horizontal_link we may have changed.
+        for qh in &self.statics.qh_pool[2..=NUM_QH] {
+            Imxrt1062HostController::cache_clean_qh(qh as *const QueueHead);
+        }
+
+        // 2. Wait ≥1 ms for the controller to cross a frame boundary.
+        //
+        // After unlinking, the controller may complete an in-progress access
+        // to this QH for the current frame. A ~1 ms busy-wait (one EHCI frame
+        // at full speed = 1 ms) ensures no further DMA accesses will occur
+        // before we release the memory.
+        cortex_m::asm::delay(600_000); // 1 ms at 600 MHz
+
+        // 3. Free the qTD back to the pool.
+        unsafe {
+            let qtd =
+                &self.statics.qtd_pool[self.qtd_index] as *const TransferDescriptor as *mut TransferDescriptor;
+            (*qtd).next.write(ehci::LINK_TERMINATE);
+            (*qtd).alt_next.write(ehci::LINK_TERMINATE);
+            (*qtd).token.write(0);
+            for buf in &mut (*qtd).buffer {
+                buf.write(0);
+            }
+        }
+
+        // 4. Mark the QH as unused (cleared on next init_endpoint() call too,
+        //    but explicit clear guards against stale flag reads).
+        unsafe { (*qh_ptr).sw_flags.write(0) };
+
+        // 5. `self.pipe` drops here, returning the bulk_pipes pool slot.
+    }
+}
+
+// Safety: Imxrt1062InterruptPipe holds *const RegisterBlock (stable MMIO address)
+// and &'static references. It is safe to send between tasks.
+unsafe impl Send for Imxrt1062InterruptPipe {}
 
 // ---------------------------------------------------------------------------
 // HostController trait implementation
@@ -1375,25 +1746,43 @@ impl HostController for Imxrt1062HostController {
 
     async fn alloc_interrupt_pipe(
         &self,
-        _address: u8,
-        _transfer_extras: TransferExtras,
-        _endpoint: u8,
-        _max_packet_size: u16,
-        _interval_ms: u8,
+        address: u8,
+        transfer_extras: TransferExtras,
+        endpoint: u8,
+        max_packet_size: u16,
+        interval_ms: u8,
     ) -> Imxrt1062InterruptPipe {
-        // Phase 2c stub — just wait forever since we can't actually allocate
-        core::future::pending().await
+        let pipe = Pipe::new(self.statics.bulk_pipes.alloc().await, 1);
+        self.do_alloc_interrupt_pipe(
+            pipe,
+            address,
+            transfer_extras,
+            endpoint,
+            max_packet_size,
+            interval_ms,
+        )
     }
 
     fn try_alloc_interrupt_pipe(
         &self,
-        _address: u8,
-        _transfer_extras: TransferExtras,
-        _endpoint: u8,
-        _max_packet_size: u16,
-        _interval_ms: u8,
+        address: u8,
+        transfer_extras: TransferExtras,
+        endpoint: u8,
+        max_packet_size: u16,
+        interval_ms: u8,
     ) -> Result<Self::InterruptPipe, UsbError> {
-        // Phase 2c stub
-        Err(UsbError::AllPipesInUse)
+        let pooled = self
+            .statics
+            .bulk_pipes
+            .try_alloc()
+            .ok_or(UsbError::AllPipesInUse)?;
+        Ok(self.do_alloc_interrupt_pipe(
+            Pipe::new(pooled, 1),
+            address,
+            transfer_extras,
+            endpoint,
+            max_packet_size,
+            interval_ms,
+        ))
     }
 }

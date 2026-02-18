@@ -14,6 +14,49 @@
 //! <https://github.com/rust-embedded/cortex-m/pull/320> indicates that this might
 //! be available in a near-future cortex-m crate.
 
+/// Invalidates D-cache by address (discard only, no write-back).
+///
+/// * `addr`: The address to invalidate.
+/// * `size`: The number of bytes to invalidate.
+///
+/// Invalidates D-cache starting from the first cache line containing `addr`,
+/// finishing once at least `size` bytes have been invalidated.
+///
+/// **Warning**: Any dirty data in the invalidated cache lines is **discarded**
+/// without being written back to main memory. This is correct for DMA receive
+/// buffers (where RAM contents written by hardware are authoritative), but
+/// must NOT be used for data the CPU has modified and not yet flushed.
+///
+/// It is recommended that `addr` is aligned to the cache line size and `size`
+/// is a multiple of the cache line size, otherwise surrounding data will also
+/// be invalidated.
+pub fn invalidate_dcache_by_address(addr: usize, size: usize) {
+    // No-op zero sized operations
+    if size == 0 {
+        return;
+    }
+
+    // Safety: write-only registers, pointer to static memory
+    let cbp = unsafe { &*cortex_m::peripheral::CBP::PTR };
+
+    cortex_m::asm::dsb();
+
+    // Cache lines are fixed to 32 bytes on Cortex-M7
+    const LINESIZE: usize = 32;
+    let num_lines = ((size - 1) / LINESIZE) + 1;
+
+    let mut addr = addr & 0xFFFF_FFE0;
+
+    for _ in 0..num_lines {
+        // Safety: write to Cortex-M write-only register — DCIMVAC (invalidate only)
+        unsafe { cbp.dcimvac.write(addr as u32) };
+        addr += LINESIZE;
+    }
+
+    cortex_m::asm::dsb();
+    cortex_m::asm::isb();
+}
+
 /// Cleans and invalidates D-cache by address.
 ///
 /// * `addr`: The address to clean and invalidate.
