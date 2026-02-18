@@ -140,7 +140,7 @@ pub trait HostController {
 
 | Sub-phase | Scope | Milestone |
 |-----------|-------|-----------|
-| **2a** (3-4 days) | Device detection, port reset, control transfers | `GET_DESCRIPTOR` works ✨ |
+| **2a** (3-4 days) | Device detection, port reset, control transfers | ✅ COMPLETE — Full USB enumeration working (VID=045e PID=00db) |
 | **2b** (2-3 days) | `bulk_in_transfer()`, `bulk_out_transfer()` | USB flash drive sector read |
 | **2c** (2-3 days) | `alloc_interrupt_pipe()`, `try_alloc_interrupt_pipe()` | HID keyboard input received |
 
@@ -233,10 +233,35 @@ pub trait HostController {
    - Chapter 9: USB Device Framework (standard requests, descriptor types)
    - Chapter 11: Hub Specification (split transactions, TT)
 
+4. **RTIC v2 Book** (Real-Time Interrupt-driven Concurrency)
+   - URL: https://rtic.rs/2/book/en/
+   - Summary: Official documentation for RTIC v2, the hardware-accelerated Rust RTOS used by this project for async task execution and interrupt management on Cortex-M7. RTIC leverages ARM NVIC hardware for zero-cost priority-based scheduling using the Stack Resource Policy (SRP), providing deadlock-free, race-free resource access with compile-time analysis.
+   - **Key sections for this project**:
+     - **The `#[app]` attribute** — Defining the RTIC application: `device` PAC argument, `dispatchers` list for software task priority levels
+     - **Hardware tasks** — Binding tasks to interrupt vectors with `#[task(binds = InterruptName)]` (used for `USB_OTG2` IRQ handler)
+     - **Software tasks & spawn** — `async fn` software tasks, `spawn()` API, dispatcher interrupt assignment (used for USB enumeration task)
+     - **Resource usage** — `#[shared]` resources with `lock()` (Mutex trait / SRP ceiling), `#[local]` resources, `#[lock_free]` for same-priority access
+     - **App initialization (`#[init]`)** — Returning `(Shared, Local)` resources, `'static` lifetime locals, peripheral access via `cx.device`/`cx.core`
+     - **Channels** — `rtic_sync::channel` for inter-task communication (`Sender`/`Receiver`, `make_channel!`)
+     - **Delay and Timeout using Monotonics** — `Mono::delay()`, `Mono::timeout_at()`, `select_biased!` for async timeouts
+     - **Target Architecture (Cortex-M7)** — BASEPRI-based priority ceiling (ARMv7-M), mapping SRP to NVIC hardware
+
+5. **The Embedded Rust Book**
+   - URL: https://docs.rust-embedded.org/book/
+   - Summary: Official introductory book for bare-metal embedded Rust on ARM Cortex-M. Covers the foundational concepts underlying this project: `#![no_std]` environments, memory-mapped register access patterns (PAC → HAL → BSP layering), interrupt handling, peripheral singletons, concurrency primitives, and the `embedded-hal` trait ecosystem.
+   - **Key sections for this project**:
+     - **`no_std` Rust Environment** — `#![no_std]`/`#![no_main]`, `libcore` vs `libstd`, runtime differences for bare-metal targets
+     - **Memory Mapped Registers** — PAC/HAL/BSP crate layering model (directly applicable to `imxrt-ral` → `imxrt-hal` → `board` crate architecture); `read()`/`write()`/`modify()` register access patterns
+     - **Exceptions & Interrupts** — Cortex-M exception model, `#[exception]`/`#[interrupt]` attributes, NVIC priority configuration, `static mut` safety in handlers
+     - **Concurrency** — Critical sections (`cortex_m::interrupt::free`), `Mutex<RefCell<Option<T>>>` pattern for sharing peripherals between main and ISR, atomics, `Send`/`Sync` trait requirements
+     - **Singletons & Peripherals** — Ownership model for hardware peripherals (`Peripherals::take()`), ensuring single-instance access, type-state patterns
+     - **Portability (`embedded-hal`)** — Trait-based hardware abstraction, HAL crate conventions (`constrain()`/`split()`), driver portability
+     - **Tips for embedded C developers** — Volatile access (`read_volatile`/`write_volatile`), `#[repr(C)]`/`#[repr(align)]` for DMA structures, packed types, build system integration
+
 ### Code References
 
-> **Local checkouts**: `cotton`, `imxrt-hal`, and `USBHost_t36` are checked out in the
-> parent directory (`../`) alongside this project.
+> **Local checkouts**: `cotton`, `imxrt-hal`, `teensy-rs`, and `USBHost_t36` are checked out in the
+> parent directory (`../`) alongside this project and are also in the VS Code Workspace for this project.
 
 1. **cotton-usb-host RP2040 implementation** (primary reference for trait implementation pattern)
    - Repository: https://github.com/pdh11/cotton
@@ -251,15 +276,24 @@ pub trait HostController {
    - Useful for: QH/qTD structure setup, async/periodic schedule management, i.MX RT-specific initialization
 
 3. **imxrt-hal USB device implementation** (i.MX RT register access patterns)
+   - Repository: https://github.com/imxrt-rs/imxrt-hal
    - Local: `../imxrt-hal`
    - Shows PHY initialization, clock setup, register naming conventions
-   - File: within the `imxrt-hal` crate (USB device driver)
 
-4. **Linux EHCI driver** (authoritative, handles all edge cases)
+4. **imxrt-ral USB device implementation** (i.MX RT register access definitions)
+   - Repository: https://github.com/imxrt-rs/imxrt-ral
+   - Local: `../imxrt-ral`
+
+6. **Teensy-specific HAL/RAL modifications***
+   - Repository: https://github.com/mciantyre/teensy4-rs
+   - Local: `../teensy-rs`
+   - Teensy-specific hardware definitions that modify `imxrt-hal` and `imxrt-ral`.
+
+7. **Linux EHCI driver** (authoritative, handles all edge cases)
    - Kernel source: `drivers/usb/host/ehci-hcd.c`, `ehci-q.c`, `ehci-sched.c`
    - Most comprehensive EHCI reference; useful for debugging tricky issues
 
-5. **Teensyduino USB host implementation** (C++ reference for same hardware)
+8. **Teensyduino USB host implementation** (C++ reference for same hardware)
    - Repository: https://github.com/PaulStoffregen/USBHost_t36
    - Local: `../USBHost_t36`
    - Directly targets the i.MX RT 1062 (Teensy 4.x) EHCI controller
@@ -391,7 +425,7 @@ ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_EMC_40, 0x0008);
 | Phase | Description | Duration | Key Milestone |
 |-------|-------------|----------|---------------|
 | **Phase 1** | **Foundation and initialization** | **2-3 days** | **✅ Controller in host mode, device detected** |
-| Phase 2a | Device detect + port reset + control transfers | 3-4 days | `GET_DESCRIPTOR` works ✨ |
+| **Phase 2a** | **Device detect + port reset + control transfers** | **3-4 days** | **✅ COMPLETE — Full USB enumeration working (VID=045e PID=00db)** |
 | Phase 2b | Bulk transfers | 2-3 days | USB flash drive sector read |
 | Phase 2c | Interrupt pipes | 2-3 days | HID keyboard input received |
 | Phase 3 | Interrupts, async, cache polish | 2-3 days | Reliable operation, no corruption |
@@ -458,6 +492,7 @@ Phase-specific open questions have been moved to their respective phase document
 
 ---
 
-**Document Version**: 3.0  
-**Date**: 2026-02-08  
-**Status**: Phase 1 COMPLETE — Device detection confirmed (low-speed keyboard via external 5V)
+**Document Version**: 3.9
+**Date**: 2026-02-17
+**Status**: \u2705 Phase 2a COMPLETE \u2014 full USB enumeration working on hardware.
+**Latest**: Low-speed Microsoft keyboard (VID=045e PID=00db) successfully enumerated via cotton-usb-host UsbBus framework. Four bugs fixed during debugging: (1) QH horizontal_link cache flush, (2) NAK_RL=15, (3) alloc_qtd double-allocation, (4) ISR clearing USBSTS.AAI before AsyncAdvanceWait could read it. Next: Phase 2b (bulk transfers).

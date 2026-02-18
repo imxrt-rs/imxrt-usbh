@@ -413,6 +413,7 @@ dependencies = [
  "cotton-usb-host",
  "critical-section",
  "defmt 0.3.100",
+ "futures",
  "imxrt-hal",
  "imxrt-iomuxc",
  "imxrt-log",

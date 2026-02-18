@@ -6,9 +6,17 @@
 - Phase 2b: USB flash drive sector read (2-3 days)
 - Phase 2c: HID keyboard input received (2-3 days)
 
+## Sub-phase → Section Mapping
+
+| Sub-phase | Sections | Scope |
+|-----------|----------|-------|
+| **2a** | 2.1, 2.2, 2.3 | Device detection, port reset, control transfers |
+| **2b** | 2.5 | Bulk IN/OUT transfers |
+| **2c** | 2.4 | Interrupt pipe allocation and streaming |
+
 ## 2.1 Device Detection (`device_detect()` → `Imxrt1062DeviceDetect`)
 
-- [ ] Implement `Imxrt1062DeviceDetect` as `Stream<Item = DeviceStatus>`
+- [x] Implement `Imxrt1062DeviceDetect` as `Stream<Item = DeviceStatus>`
   - `poll_next()`: Register waker with `shared.device_waker`, then check `PORTSC1`:
     - Clear `PORTSC1[CSC]` (Connect Status Change) if set
     - Read `PORTSC1[CCS]` (Current Connect Status)
@@ -18,8 +26,8 @@
       - `PSPD = 0b10` → High Speed (480 Mbps) → `UsbSpeed::High480` (future)
     - If not connected: yield `DeviceStatus::Absent`
   - Re-enable port change interrupt in `USBINTR` after handling (disable-on-handle pattern from RP2040)
-- [ ] Implement `device_detect()` method — creates and returns `Imxrt1062DeviceDetect`
-- [ ] ISR integration: `on_irq()` checks `USBSTS[PCI]`, clears it, disables PCI in `USBINTR`, wakes `device_waker`
+- [x] Implement `device_detect()` method — creates and returns `Imxrt1062DeviceDetect`
+- [x] ISR integration: `on_irq()` checks `USBSTS[PCI]`, clears it, disables PCI in `USBINTR`, wakes `device_waker`
 
 ### i.MX RT PORTSC1 Speed Detection Notes
 
@@ -29,7 +37,7 @@
 
 ## 2.2 Root Port Reset (`reset_root_port(rst: bool)`)
 
-- [ ] Implement `reset_root_port(rst: bool)` method
+- [x] Implement `reset_root_port(rst: bool)` method
   - `rst = true`: Set `PORTSC1[PR]` (Port Reset) — begins USB reset signaling
   - `rst = false`: Clear `PORTSC1[PR]` — ends reset signaling
   - **Important**: The caller (UsbBus) handles timing — it calls with `true`, waits ≥50ms, then calls with `false`
@@ -38,8 +46,13 @@
 
 ## 2.3 Control Transfers (`control_transfer()`)
 
-- [ ] Implement `Imxrt1062ControlTransfer` as `Future<Output = Result<usize, UsbError>>`
-- [ ] Implement the `control_transfer()` method
+- [x] Implement `TransferComplete` as `Future<Output = Result<(), UsbError>>`
+- [x] Implement the `control_transfer()` method
+- [x] Implement `AsyncAdvanceWait` future for safe QH unlinking
+- [x] Implement qTD allocation/freeing helpers
+- [x] Implement async schedule link/unlink helpers
+- [x] Implement EHCI error mapping (`map_qtd_error`)
+- [x] Implement cache clean/invalidate wrappers
 
 ### Detailed Async State Machine
 
