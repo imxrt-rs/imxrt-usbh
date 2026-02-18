@@ -3,3 +3,6 @@ docs/external
 imxrt-usbh.code-workspace
 .vscode/tasks.json
 *.hex
+commit_message.txt
+/.claude
+CLAUDE.

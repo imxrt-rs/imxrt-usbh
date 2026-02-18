@@ -8,8 +8,10 @@ cortex-m = "0.7"
 ral-registers = "0.1"
 bitflags = "2"
 cotton-usb-host = { path = "../cotton/cotton-usb-host", default-features = false }
+futures = { version = "0.3", default-features = false }
 rtic-common = "1"
 critical-section = "1.1"
+log = { version = "0.4", optional = true }
 
 [dependencies.defmt-03]
 package = "defmt"
@@ -17,7 +19,12 @@ version = "0.3"
 optional = true
 
 [features]
+default = ["log"]
 defmt-03 = ["dep:defmt-03"]
+log = ["dep:log"]
+
+[profile.release]
+debug = true
 
 [dev-dependencies]
 defmt = "0.3"

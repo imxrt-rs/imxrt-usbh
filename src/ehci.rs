@@ -393,7 +393,7 @@ pub const fn qh_characteristics(
         | head << QH_CHAR_HEAD_SHIFT
         | (max_packet_size as u32) << QH_CHAR_MAX_PKT_SHIFT
         | ctrl_ep << QH_CHAR_CTRL_EP_SHIFT
-    // NAK reload left at 0 (controller uses default NAK throttling)
+        | 15u32 << QH_CHAR_NAK_RL_SHIFT
 }
 
 // ---------------------------------------------------------------------------

@@ -21,9 +21,25 @@
 //! Both `UsbShared` and `UsbStatics` are `const`-constructible and designed to
 //! live in `static` storage (typically via `ConstStaticCell`).
 
-use crate::ehci::{FrameList, QueueHead, TransferDescriptor};
+use crate::cache;
+use crate::ehci::{
+    self, link_pointer, link_type, FrameList, QueueHead, TransferDescriptor, LINK_TERMINATE,
+    PID_IN, PID_OUT, PID_SETUP, QTD_TOKEN_ACTIVE, QTD_TOKEN_BABBLE, QTD_TOKEN_BUFFER_ERR,
+    QTD_TOKEN_HALTED, QTD_TOKEN_MISSED_UFRAME, QTD_TOKEN_XACT_ERR, SPEED_FULL, SPEED_HIGH,
+    SPEED_LOW,
+};
 use crate::ral;
+use core::cell::Cell;
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
 use cotton_usb_host::async_pool::Pool;
+use cotton_usb_host::host_controller::{
+    DataPhase, DeviceStatus, HostController, InterruptPacket, TransferExtras, TransferType,
+    UsbError, UsbSpeed,
+};
+use cotton_usb_host::wire::SetupPacket;
+use futures::Stream;
 use rtic_common::waker_registration::CriticalSectionWakerRegistration;
 
 // ---------------------------------------------------------------------------
@@ -109,8 +125,11 @@ impl UsbShared {
         // Read which interrupts fired
         let status = ral::read_reg!(ral::usb, usb, USBSTS);
 
-        // Acknowledge all pending status bits (W1C)
-        ral::write_reg!(ral::usb, usb, USBSTS, status);
+        // Acknowledge pending status bits (W1C), but NOT AAI (bit 5).
+        // AsyncAdvanceWait::poll() reads USBSTS.AAI directly to detect
+        // completion — if we cleared it here, the poll function would
+        // miss it and hang forever.
+        ral::write_reg!(ral::usb, usb, USBSTS, status & !(1 << 5));
 
         // Port Change Interrupt — wake the device-detect stream
         if status & (1 << 2) != 0 {
@@ -143,6 +162,29 @@ impl UsbShared {
         // The async poll functions will re-enable them when they go Pending.
         let serviced = status & 0x000F_003F; // mask to defined interrupt bits
         ral::modify_reg!(ral::usb, usb, USBINTR, |intr| intr & !serviced);
+    }
+
+    /// Called from the `USB_OTG2` interrupt handler (public API).
+    ///
+    /// This is a convenience wrapper around [`on_irq`](Self::on_irq) that
+    /// accepts a raw pointer to the USB OTG register block, avoiding the need
+    /// to reference crate-internal RAL types from application code.
+    ///
+    /// # Arguments
+    ///
+    /// - `usb_base` — pointer to the USB OTG core register block. For USB2 on
+    ///   the i.MX RT 1062, this is `0x402E_0200`.
+    ///
+    /// # Safety
+    ///
+    /// - Must be called from interrupt context (or with interrupts disabled).
+    /// - `usb_base` must point to a valid USB OTG register block.
+    pub unsafe fn on_usb_irq(&self, usb_base: *const ()) {
+        let usb = ral::usb::Instance {
+            addr: usb_base.cast(),
+        };
+        // Safety: caller guarantees usb_base points to a valid register block.
+        unsafe { self.on_irq(&usb) };
     }
 
     /// Get a reference to the device waker (for registering in DeviceDetect stream).
@@ -262,6 +304,13 @@ pub struct Imxrt1062HostController {
     /// Resource pools and DMA structures (borrowed, lives in a static).
     statics: &'static UsbStatics,
 }
+
+// Safety: Imxrt1062HostController is designed for single-task usage.
+// The raw pointer in ral::usb::Instance is stable (points to MMIO registers).
+// &'static UsbStatics is safe to send because UsbStatics lives in a static and
+// is only accessed from async task context (never from ISR).
+// &'static UsbShared uses CriticalSection-based synchronization.
+unsafe impl Send for Imxrt1062HostController {}
 
 impl Imxrt1062HostController {
     /// Create a new host controller from peripheral instances and static resources.
@@ -485,5 +534,866 @@ impl Imxrt1062HostController {
             UAIE: 1,  // USB Host Async Interrupt Enable (NXP)
             UPIE: 1   // USB Host Periodic Interrupt Enable (NXP)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Port speed detection
+    // -----------------------------------------------------------------------
+
+    /// Read the currently detected port speed from PORTSC1.
+    ///
+    /// The port speed is available in PORTSC1[PSPD] (bits 27:26) after
+    /// the port is enabled following a reset. Before reset, speed can be
+    /// inferred from the line state.
+    fn port_speed(&self) -> u32 {
+        ral::read_reg!(ral::usb, self.usb, PORTSC1, PSPD)
+    }
+
+    /// Convert the PORTSC1 PSPD field to a `DeviceStatus`.
+    fn device_status(&self) -> DeviceStatus {
+        let portsc = ral::read_reg!(ral::usb, self.usb, PORTSC1);
+        let connected = (portsc & 1) != 0; // CCS bit 0
+        if connected {
+            let pspd = (portsc >> 26) & 0x3;
+            let speed = match pspd {
+                0 => UsbSpeed::Full12,
+                1 => UsbSpeed::Low1_5,
+                2 => UsbSpeed::High480,
+                _ => UsbSpeed::Full12, // shouldn't happen
+            };
+            DeviceStatus::Present(speed)
+        } else {
+            DeviceStatus::Absent
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Re-enable port change interrupt
+    // -----------------------------------------------------------------------
+
+    /// Re-enable the port change interrupt (PCE, bit 2) in USBINTR.
+    ///
+    /// Called from poll functions after checking device status, following
+    /// the disable-on-handle / re-enable-on-poll pattern.
+    fn reenable_port_change_interrupt(&self) {
+        ral::modify_reg!(ral::usb, self.usb, USBINTR, |v| v | (1 << 2));
+    }
+
+    /// Re-enable transfer completion interrupts in USBINTR.
+    ///
+    /// Re-enables: UE (bit 0), UEE (bit 1), UAIE (bit 18), UPIE (bit 19).
+    fn reenable_transfer_interrupts(&self) {
+        ral::modify_reg!(ral::usb, self.usb, USBINTR, |v| v
+            | (1 << 0)   // UE
+            | (1 << 1)   // UEE
+            | (1 << 18)  // UAIE
+            | (1 << 19)  // UPIE
+        );
+    }
+
+    /// Re-enable the async advance interrupt (AAE, bit 5) in USBINTR.
+    fn reenable_async_advance_interrupt(&self) {
+        ral::modify_reg!(ral::usb, self.usb, USBINTR, |v| v | (1 << 5));
+    }
+
+    // -----------------------------------------------------------------------
+    // PORTSC1 W1C-safe writes
+    // -----------------------------------------------------------------------
+
+    /// PORTSC1 write-1-to-clear bit mask.
+    ///
+    /// When doing a read-modify-write on PORTSC1, these bits must be masked
+    /// off to avoid accidentally clearing them. Per EHCI spec, W1C bits:
+    /// - CSC (bit 1) — Connect Status Change
+    /// - PEC (bit 3) — Port Enable/Disable Change  (not in NXP, but safe)
+    /// - OCC (bit 5) — Over-current Change
+    /// - FPR (bit 6) — Force Port Resume (read as 0 when not suspended)
+    const PORTSC1_W1C_MASK: u32 = (1 << 1) | (1 << 3) | (1 << 5) | (1 << 6);
+
+    /// Read PORTSC1 with W1C bits cleared to prevent accidental clear.
+    ///
+    /// This should be used before any modify_reg! on PORTSC1 to ensure
+    /// we don't accidentally write 1 to a W1C bit.
+    fn portsc1_read_safe(&self) -> u32 {
+        ral::read_reg!(ral::usb, self.usb, PORTSC1) & !Self::PORTSC1_W1C_MASK
+    }
+
+    // -----------------------------------------------------------------------
+    // QH / qTD allocation helpers
+    // -----------------------------------------------------------------------
+
+    /// Allocate a QH from the pool by index.
+    ///
+    /// Returns a mutable pointer to the QH. Index 0 is reserved for sentinel.
+    /// Caller must ensure the index is valid (1..=NUM_QH).
+    ///
+    /// # Safety
+    /// The caller must ensure exclusive access to the QH at the given index.
+    unsafe fn qh_mut(&self, index: usize) -> *mut QueueHead {
+        &self.statics.qh_pool[index] as *const QueueHead as *mut QueueHead
+    }
+
+    /// Get a mutable pointer to a qTD from the pool by index.
+    ///
+    /// # Safety
+    /// The caller must ensure exclusive access to the qTD at the given index.
+    unsafe fn qtd_mut(&self, index: usize) -> *mut TransferDescriptor {
+        &self.statics.qtd_pool[index] as *const TransferDescriptor as *mut TransferDescriptor
+    }
+
+    /// Find a free qTD slot in the pool.
+    ///
+    /// Scans the qtd_pool for an entry that doesn't have the Active bit set
+    /// and isn't otherwise in use. Returns the index, or `None` if all slots
+    /// are in use.
+    fn alloc_qtd(&self) -> Option<usize> {
+        for i in 0..NUM_QTD {
+            let qtd = &self.statics.qtd_pool[i];
+            // A free qTD will have token == 0 (not active or halted with no state)
+            if qtd.token.read() == 0 && qtd.next.read() == LINK_TERMINATE {
+                // Mark as allocated immediately to prevent double-allocation.
+                // Without this, a second alloc_qtd() call before the first qTD
+                // is init'd would return the same index.
+                unsafe {
+                    let qtd_ptr = self.qtd_mut(i);
+                    (*qtd_ptr).token.write(ehci::QTD_TOKEN_ACTIVE);
+                }
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Return a qTD to the pool (mark it as free).
+    ///
+    /// # Safety
+    /// The caller must ensure the qTD is no longer referenced by any QH.
+    unsafe fn free_qtd(&self, index: usize) {
+        unsafe {
+            let qtd = self.qtd_mut(index);
+            (*qtd).next.write(LINK_TERMINATE);
+            (*qtd).alt_next.write(LINK_TERMINATE);
+            (*qtd).token.write(0);
+            for buf in &mut (*qtd).buffer {
+                buf.write(0);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Async schedule management
+    // -----------------------------------------------------------------------
+
+    /// Link a QH into the async schedule (after the sentinel at index 0).
+    ///
+    /// # Safety
+    /// - The QH must be fully initialized.
+    /// - Cache must be cleaned after this call.
+    unsafe fn link_qh_to_async_schedule(&self, qh: *mut QueueHead) {
+        unsafe {
+            let sentinel = self.qh_mut(0);
+
+            // new_qh → sentinel's old successor
+            (*qh).horizontal_link.write((*sentinel).horizontal_link.read());
+
+            // sentinel → new_qh
+            let qh_addr = qh as u32;
+            (*sentinel)
+                .horizontal_link
+                .write(link_pointer(qh_addr, link_type::QH));
+        }
+    }
+
+    /// Unlink a QH from the async schedule.
+    ///
+    /// Finds the QH that points to `qh` and updates its horizontal_link
+    /// to skip over `qh`.
+    ///
+    /// # Safety
+    /// - The QH must be in the async schedule.
+    unsafe fn unlink_qh_from_async_schedule(&self, qh: *mut QueueHead) {
+        unsafe {
+            let qh_addr = qh as u32;
+            let sentinel = self.qh_mut(0);
+
+            // Walk the circular list starting from sentinel to find the predecessor
+            let mut prev = sentinel;
+            loop {
+                let next_link = (*prev).horizontal_link.read();
+                let next_addr = ehci::link_address(next_link);
+                if next_addr == (qh_addr & !0x1F) {
+                    // Found it — point prev around qh
+                    (*prev)
+                        .horizontal_link
+                        .write((*qh).horizontal_link.read());
+                    break;
+                }
+                prev = next_addr as *mut QueueHead;
+
+                // Safety: if we wrap around to sentinel without finding qh, the QH
+                // wasn't in the list — this shouldn't happen if called correctly.
+                if prev == sentinel {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Enable the async schedule if not already enabled.
+    fn enable_async_schedule(&self) {
+        let cmd = ral::read_reg!(ral::usb, self.usb, USBCMD);
+        if cmd & (1 << 5) == 0 {
+            // ASE bit 5
+            ral::modify_reg!(ral::usb, self.usb, USBCMD, |v| v | (1 << 5));
+        }
+    }
+
+    /// Ring the async advance doorbell and wait for acknowledgement.
+    ///
+    /// This must be called after unlinking a QH from the async schedule
+    /// to ensure the controller is no longer accessing it before freeing.
+    async fn wait_async_advance(&self) {
+        // Register waker before ringing doorbell to avoid race
+        let waker_future = AsyncAdvanceWait {
+            usb: &self.usb,
+            shared: self.shared,
+        };
+        // Set IAA (Interrupt on Async Advance) bit in USBCMD
+        ral::modify_reg!(ral::usb, self.usb, USBCMD, |v| v | (1 << 6));
+        waker_future.await;
+    }
+
+    // -----------------------------------------------------------------------
+    // EHCI error mapping
+    // -----------------------------------------------------------------------
+
+    /// Map EHCI qTD status bits to a `UsbError`.
+    fn map_qtd_error(token: u32) -> UsbError {
+        if token & QTD_TOKEN_HALTED != 0 {
+            if token & QTD_TOKEN_BABBLE != 0 {
+                return UsbError::Overflow;
+            }
+            if token & QTD_TOKEN_BUFFER_ERR != 0 {
+                return UsbError::Overflow;
+            }
+            if token & QTD_TOKEN_XACT_ERR != 0 {
+                return UsbError::ProtocolError;
+            }
+            // Halted with no other error bits set → STALL
+            return UsbError::Stall;
+        }
+        if token & QTD_TOKEN_MISSED_UFRAME != 0 {
+            return UsbError::Timeout;
+        }
+        UsbError::ProtocolError
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache maintenance wrappers
+    // -----------------------------------------------------------------------
+
+    /// Clean and invalidate a QH for DMA.
+    fn cache_clean_qh(qh: *const QueueHead) {
+        cache::clean_invalidate_dcache_by_address(qh as usize, core::mem::size_of::<QueueHead>());
+    }
+
+    /// Clean and invalidate a qTD for DMA.
+    fn cache_clean_qtd(qtd: *const TransferDescriptor) {
+        cache::clean_invalidate_dcache_by_address(
+            qtd as usize,
+            core::mem::size_of::<TransferDescriptor>(),
+        );
+    }
+
+    /// Clean and invalidate a data buffer for DMA.
+    fn cache_clean_buffer(addr: *const u8, len: usize) {
+        if len > 0 {
+            cache::clean_invalidate_dcache_by_address(addr as usize, len);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Control transfer implementation
+    // -----------------------------------------------------------------------
+
+    /// Perform an EHCI control transfer using a qTD chain.
+    ///
+    /// Builds 2–3 qTDs (setup + optional data + status), configures a QH,
+    /// links it to the async schedule, and waits for completion.
+    async fn do_control_transfer(
+        &self,
+        address: u8,
+        transfer_extras: TransferExtras,
+        packet_size: u8,
+        setup: &SetupPacket,
+        data_phase: &mut DataPhase<'_>,
+    ) -> Result<usize, UsbError> {
+        // Allocate a QH (index 1 is reserved for control transfers)
+        let qh_index = 1;
+        let qh = unsafe { self.qh_mut(qh_index) };
+
+        // Determine port speed
+        let speed = match self.port_speed() {
+            0 => SPEED_FULL,
+            1 => SPEED_LOW,
+            2 => SPEED_HIGH,
+            _ => SPEED_FULL,
+        };
+
+        // Build QH characteristics
+        let characteristics = ehci::qh_characteristics(
+            address,
+            0,              // endpoint 0 (control)
+            speed,
+            packet_size as u16,
+            true,           // is_control
+            false,          // not head of reclamation
+        );
+
+        // Build QH capabilities — handle TransferExtras::WithPreamble for
+        // split transactions (FS/LS device behind HS hub)
+        let capabilities = match transfer_extras {
+            TransferExtras::Normal => ehci::qh_capabilities(0, 0, 0, 0, 1),
+            TransferExtras::WithPreamble => {
+                // For split transactions, we need the hub address and port.
+                // WithPreamble is used for LS devices behind FS hubs.
+                // In EHCI, split transactions require hub_addr and hub_port
+                // in the QH capabilities, plus S-mask/C-mask.
+                // For now, set default values — proper hub support requires
+                // additional context from the caller.
+                ehci::qh_capabilities(0, 0, 0, 0, 1)
+            }
+        };
+
+        // Initialise the QH
+        unsafe { (*qh).init_endpoint(characteristics, capabilities) };
+
+        // ---- Build the qTD chain ----
+
+        // We need up to 3 qTDs: setup, data (optional), status
+        let setup_qtd_idx = self.alloc_qtd().ok_or(UsbError::AllPipesInUse)?;
+        let data_qtd_idx = match data_phase {
+            DataPhase::In(_) | DataPhase::Out(_) => {
+                Some(self.alloc_qtd().ok_or_else(|| {
+                    unsafe { self.free_qtd(setup_qtd_idx) };
+                    UsbError::AllPipesInUse
+                })?)
+            }
+            DataPhase::None => None,
+        };
+        let status_qtd_idx = self.alloc_qtd().ok_or_else(|| {
+            if let Some(idx) = data_qtd_idx {
+                unsafe { self.free_qtd(idx) };
+            }
+            unsafe { self.free_qtd(setup_qtd_idx) };
+            UsbError::AllPipesInUse
+        })?;
+
+        // Setup qTD: PID=SETUP, 8 bytes, data toggle=0, no IOC
+        let setup_qtd = unsafe { self.qtd_mut(setup_qtd_idx) };
+        let setup_bytes = setup as *const SetupPacket as *const u8;
+        let setup_token = ehci::qtd_token(PID_SETUP, 8, false, false);
+        unsafe { (*setup_qtd).init(setup_token, setup_bytes, 8) };
+
+        // Data qTD (if present)
+        let data_len: usize;
+        match data_phase {
+            DataPhase::In(ref buf) => {
+                data_len = buf.len();
+                let data_qtd = unsafe { self.qtd_mut(data_qtd_idx.unwrap()) };
+                let data_token =
+                    ehci::qtd_token(PID_IN, data_len as u32, true, false);
+                unsafe {
+                    (*data_qtd).init(data_token, buf.as_ptr(), data_len as u32);
+                }
+            }
+            DataPhase::Out(ref buf) => {
+                data_len = buf.len();
+                let data_qtd = unsafe { self.qtd_mut(data_qtd_idx.unwrap()) };
+                let data_token =
+                    ehci::qtd_token(PID_OUT, data_len as u32, true, false);
+                unsafe {
+                    (*data_qtd).init(data_token, buf.as_ptr(), data_len as u32);
+                }
+            }
+            DataPhase::None => {
+                data_len = 0;
+            }
+        }
+
+        // Status qTD: opposite direction of data (or IN if no data), 0 bytes,
+        // data toggle=1, IOC=true
+        let status_pid = match data_phase {
+            DataPhase::In(_) => PID_OUT,
+            DataPhase::Out(_) | DataPhase::None => PID_IN,
+        };
+        let status_qtd = unsafe { self.qtd_mut(status_qtd_idx) };
+        let status_token = ehci::qtd_token(status_pid, 0, true, true);
+        unsafe { (*status_qtd).init(status_token, core::ptr::null(), 0) };
+
+        // Chain qTDs: setup → data (optional) → status
+        match data_qtd_idx {
+            Some(data_idx) => {
+                let data_qtd_ptr = unsafe { self.qtd_mut(data_idx) };
+                unsafe {
+                    (*setup_qtd).next.write(data_qtd_ptr as u32);
+                    (*data_qtd_ptr).next.write(status_qtd as u32);
+                }
+            }
+            None => {
+                unsafe {
+                    (*setup_qtd).next.write(status_qtd as u32);
+                }
+            }
+        }
+
+        // Attach the first qTD to the QH
+        unsafe { (*qh).attach_qtd(setup_qtd) };
+
+        // ---- Cache maintenance before DMA ----
+
+        // Clean the setup packet data (it's on the stack, needs to be in RAM)
+        Self::cache_clean_buffer(setup_bytes, 8);
+
+        // Clean outgoing data buffer if applicable
+        if let DataPhase::Out(ref buf) = data_phase {
+            Self::cache_clean_buffer(buf.as_ptr(), buf.len());
+        }
+
+        // Clean all qTDs
+        Self::cache_clean_qtd(setup_qtd);
+        if let Some(data_idx) = data_qtd_idx {
+            Self::cache_clean_qtd(unsafe { self.qtd_mut(data_idx) });
+        }
+        Self::cache_clean_qtd(status_qtd);
+
+        // Clean the QH
+        Self::cache_clean_qh(qh);
+
+        // Clean the sentinel QH (we're about to modify its horizontal_link)
+        let sentinel = unsafe { self.qh_mut(0) };
+        Self::cache_clean_qh(sentinel);
+
+        // ---- Link QH to async schedule and enable ----
+
+        unsafe { self.link_qh_to_async_schedule(qh) };
+
+        // Clean both QH and sentinel after linking (both horizontal_links changed)
+        Self::cache_clean_qh(qh);
+        Self::cache_clean_qh(sentinel);
+
+        self.enable_async_schedule();
+
+        // ---- Poll for completion ----
+
+        let result = TransferComplete {
+            usb: &self.usb,
+            shared: self.shared,
+            status_qtd: status_qtd as *const TransferDescriptor,
+            data_qtd: data_qtd_idx.map(|i| &self.statics.qtd_pool[i] as *const TransferDescriptor),
+            qh: qh as *const QueueHead,
+        }
+        .await;
+
+        // ---- Unlink QH from async schedule ----
+
+        unsafe { self.unlink_qh_from_async_schedule(qh) };
+        Self::cache_clean_qh(sentinel);
+
+        // Ring the async advance doorbell and wait
+        self.wait_async_advance().await;
+
+        // ---- Copy data for IN transfers ----
+
+        let bytes_transferred = match result {
+            Ok(()) => {
+                match data_phase {
+                    DataPhase::In(ref mut buf) => {
+                        // Invalidate cache for the IN data buffer
+                        Self::cache_clean_buffer(buf.as_ptr(), buf.len());
+
+                        // Read how many bytes were actually transferred
+                        if let Some(data_idx) = data_qtd_idx {
+                            let data_qtd_ptr = &self.statics.qtd_pool[data_idx];
+                            // Invalidate cache to read updated qTD token
+                            Self::cache_clean_qtd(data_qtd_ptr);
+                            let remaining = data_qtd_ptr.bytes_remaining() as usize;
+                            Ok(data_len - remaining)
+                        } else {
+                            Ok(0)
+                        }
+                    }
+                    DataPhase::Out(ref buf) => Ok(buf.len()),
+                    DataPhase::None => Ok(0),
+                }
+            }
+            Err(e) => Err(e),
+        };
+
+        // ---- Free resources ----
+
+        unsafe {
+            self.free_qtd(setup_qtd_idx);
+            if let Some(idx) = data_qtd_idx {
+                self.free_qtd(idx);
+            }
+            self.free_qtd(status_qtd_idx);
+            // Clear the QH state
+            (*qh).sw_flags.write(0);
+        }
+
+        bytes_transferred
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TransferComplete — future that waits for a qTD chain to complete
+// ---------------------------------------------------------------------------
+
+/// Future that polls an EHCI qTD for completion.
+///
+/// Checks the status qTD's Active bit. When cleared by the controller,
+/// the transfer is complete. Error bits are mapped to `UsbError`.
+struct TransferComplete<'a> {
+    usb: &'a ral::usb::Instance,
+    shared: &'a UsbShared,
+    status_qtd: *const TransferDescriptor,
+    data_qtd: Option<*const TransferDescriptor>,
+    qh: *const QueueHead,
+}
+
+impl Future for TransferComplete<'_> {
+    type Output = Result<(), UsbError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Register waker with pipe 0 (control pipe)
+        self.shared.pipe_wakers[0].register(cx.waker());
+
+        // Invalidate cache to see hardware updates
+        Imxrt1062HostController::cache_clean_qtd(self.status_qtd);
+        if let Some(data_qtd) = self.data_qtd {
+            Imxrt1062HostController::cache_clean_qtd(data_qtd);
+        }
+        Imxrt1062HostController::cache_clean_qh(self.qh);
+
+        let status_qtd = unsafe { &*self.status_qtd };
+        let token = status_qtd.token.read();
+
+        if token & QTD_TOKEN_ACTIVE != 0 {
+            // Still active — check if data qTD has errored (early exit)
+            if let Some(data_qtd_ptr) = self.data_qtd {
+                let data_qtd = unsafe { &*data_qtd_ptr };
+                let data_token = data_qtd.token.read();
+                if data_token & QTD_TOKEN_HALTED != 0 {
+                    // Data phase halted — map error
+                    return Poll::Ready(Err(Imxrt1062HostController::map_qtd_error(
+                        data_token,
+                    )));
+                }
+            }
+
+            // Re-enable transfer completion interrupts
+            ral::modify_reg!(ral::usb, self.usb, USBINTR, |v| v
+                | (1 << 0)   // UE
+                | (1 << 1)   // UEE
+                | (1 << 18)  // UAIE
+                | (1 << 19)  // UPIE
+            );
+            return Poll::Pending;
+        }
+
+        // Transfer complete — check for errors
+        if token & ehci::QTD_TOKEN_ERROR_MASK != 0 {
+            return Poll::Ready(Err(Imxrt1062HostController::map_qtd_error(token)));
+        }
+
+        // Also check the data qTD if present
+        if let Some(data_qtd_ptr) = self.data_qtd {
+            let data_qtd = unsafe { &*data_qtd_ptr };
+            let data_token = data_qtd.token.read();
+            if data_token & ehci::QTD_TOKEN_ERROR_MASK != 0 {
+                return Poll::Ready(Err(Imxrt1062HostController::map_qtd_error(
+                    data_token,
+                )));
+            }
+        }
+
+        Poll::Ready(Ok(()))
+    }
+}
+
+// Safety: TransferComplete holds references to static memory (QH/qTD pools)
+// and register blocks. The qTD/QH pointers point to static pool entries.
+unsafe impl Send for TransferComplete<'_> {}
+
+// ---------------------------------------------------------------------------
+// AsyncAdvanceWait — future for async advance doorbell
+// ---------------------------------------------------------------------------
+
+/// Future that waits for the EHCI async advance doorbell to be acknowledged.
+///
+/// After unlinking a QH from the async schedule, the caller rings the doorbell
+/// (sets USBCMD.IAA) and waits for USBSTS.AAI. This future polls for that.
+struct AsyncAdvanceWait<'a> {
+    usb: &'a ral::usb::Instance,
+    shared: &'a UsbShared,
+}
+
+impl Future for AsyncAdvanceWait<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.shared.async_advance_waker.register(cx.waker());
+
+        // Check if AAI (bit 5) is already set in USBSTS
+        let status = ral::read_reg!(ral::usb, self.usb, USBSTS);
+        if status & (1 << 5) != 0 {
+            // Clear it (W1C)
+            ral::write_reg!(ral::usb, self.usb, USBSTS, 1 << 5);
+            return Poll::Ready(());
+        }
+
+        // Re-enable AAE interrupt
+        ral::modify_reg!(ral::usb, self.usb, USBINTR, |v| v | (1 << 5));
+        Poll::Pending
+    }
+}
+
+// Safety: AsyncAdvanceWait holds references to static memory and register blocks.
+unsafe impl Send for AsyncAdvanceWait<'_> {}
+
+// ---------------------------------------------------------------------------
+// Imxrt1062DeviceDetect — Stream<Item = DeviceStatus>
+// ---------------------------------------------------------------------------
+
+/// Device detection stream for the i.MX RT 1062 USB host controller.
+///
+/// Monitors the root port for connect/disconnect events by polling PORTSC1.
+/// Yields `DeviceStatus::Present(speed)` when a device is connected, and
+/// `DeviceStatus::Absent` when disconnected.
+///
+/// Follows the RP2040 pattern: stores the previous status and only returns
+/// `Ready` when the status changes.
+#[derive(Copy, Clone)]
+pub struct Imxrt1062DeviceDetect {
+    usb: *const ral::usb::RegisterBlock,
+    waker: &'static CriticalSectionWakerRegistration,
+    status: DeviceStatus,
+}
+
+impl Imxrt1062DeviceDetect {
+    fn new(usb: &ral::usb::Instance, waker: &'static CriticalSectionWakerRegistration) -> Self {
+        Self {
+            usb: usb.addr as *const ral::usb::RegisterBlock,
+            waker,
+            status: DeviceStatus::Absent,
+        }
+    }
+
+    /// Read the current device status from PORTSC1.
+    fn read_device_status(&self) -> DeviceStatus {
+        let usb = unsafe { &*(self.usb as *const ral::usb::RegisterBlock) };
+        let usb_instance = ral::usb::Instance {
+            addr: usb as *const _ as *mut _,
+        };
+        let portsc = ral::read_reg!(ral::usb, usb_instance, PORTSC1);
+        let connected = (portsc & 1) != 0; // CCS bit 0
+        if connected {
+            let pspd = (portsc >> 26) & 0x3;
+            match pspd {
+                0 => DeviceStatus::Present(UsbSpeed::Full12),
+                1 => DeviceStatus::Present(UsbSpeed::Low1_5),
+                2 => DeviceStatus::Present(UsbSpeed::High480),
+                _ => DeviceStatus::Present(UsbSpeed::Full12),
+            }
+        } else {
+            DeviceStatus::Absent
+        }
+    }
+
+    /// Re-enable the port change interrupt.
+    fn reenable_interrupt(&self) {
+        let usb_instance = ral::usb::Instance {
+            addr: self.usb as *mut _,
+        };
+        ral::modify_reg!(ral::usb, usb_instance, USBINTR, |v| v | (1 << 2));
+    }
+}
+
+impl Stream for Imxrt1062DeviceDetect {
+    type Item = DeviceStatus;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.waker.register(cx.waker());
+
+        let device_status = self.read_device_status();
+
+        if device_status != self.status {
+            let usb_instance = ral::usb::Instance {
+                addr: self.usb as *mut _,
+            };
+            let portsc = ral::read_reg!(ral::usb, usb_instance, PORTSC1);
+            info!("[HC] DeviceDetect: status change  PORTSC1=0x{:08X}", portsc);
+            self.reenable_interrupt();
+            self.status = device_status;
+            Poll::Ready(Some(device_status))
+        } else {
+            self.reenable_interrupt();
+            Poll::Pending
+        }
+    }
+}
+
+// Safety: The USB register pointer is derived from a static instance.
+unsafe impl Send for Imxrt1062DeviceDetect {}
+
+// ---------------------------------------------------------------------------
+// Pipe — RAII pipe allocation wrapper
+// ---------------------------------------------------------------------------
+
+/// Wraps a pool allocation for a pipe. When dropped, returns the resource
+/// to the pool.
+struct Pipe {
+    _pooled: cotton_usb_host::async_pool::Pooled<'static>,
+    which: u8,
+}
+
+impl Pipe {
+    fn new(pooled: cotton_usb_host::async_pool::Pooled<'static>, offset: u8) -> Self {
+        let which = pooled.which() + offset;
+        Self {
+            _pooled: pooled,
+            which,
+        }
+    }
+
+    fn which(&self) -> u8 {
+        self.which
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Imxrt1062InterruptPipe — placeholder for phase 2c
+// ---------------------------------------------------------------------------
+
+/// Interrupt pipe stream for i.MX RT 1062 (placeholder for phase 2c).
+///
+/// Will be implemented in phase 2c to support interrupt endpoints.
+pub struct Imxrt1062InterruptPipe {
+    _marker: core::marker::PhantomData<()>,
+}
+
+impl Stream for Imxrt1062InterruptPipe {
+    type Item = InterruptPacket;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // Placeholder — will be implemented in phase 2c
+        Poll::Pending
+    }
+}
+
+impl Unpin for Imxrt1062InterruptPipe {}
+
+// ---------------------------------------------------------------------------
+// HostController trait implementation
+// ---------------------------------------------------------------------------
+
+impl HostController for Imxrt1062HostController {
+    type InterruptPipe = Imxrt1062InterruptPipe;
+    type DeviceDetect = Imxrt1062DeviceDetect;
+
+    fn device_detect(&self) -> Self::DeviceDetect {
+        Imxrt1062DeviceDetect::new(&self.usb, self.shared.device_waker())
+    }
+
+    fn reset_root_port(&self, rst: bool) {
+        if rst {
+            // Set PORTSC1.PR (bit 8) — begin USB reset signaling.
+            // Must preserve other bits and avoid clearing W1C bits.
+            let portsc = self.portsc1_read_safe();
+            ral::write_reg!(ral::usb, self.usb, PORTSC1, portsc | (1 << 8));
+        } else {
+            // Clear PORTSC1.PR (bit 8) — end USB reset signaling.
+            // On EHCI, the controller may auto-clear PR and set PE (port enabled).
+            let portsc = self.portsc1_read_safe();
+            ral::write_reg!(ral::usb, self.usb, PORTSC1, portsc & !(1 << 8));
+        }
+    }
+
+    async fn control_transfer<'a>(
+        &self,
+        address: u8,
+        transfer_extras: TransferExtras,
+        packet_size: u8,
+        setup: SetupPacket,
+        mut data_phase: DataPhase<'a>,
+    ) -> Result<usize, UsbError> {
+        let data_len = match &data_phase {
+            DataPhase::In(buf) => buf.len() as i32,
+            DataPhase::Out(buf) => -(buf.len() as i32),
+            DataPhase::None => 0,
+        };
+        // Allocate a control pipe (serializes control transfers)
+        let _pipe = Pipe::new(self.statics.control_pipes.alloc().await, 0);
+
+        let result = self.do_control_transfer(address, transfer_extras, packet_size, &setup, &mut data_phase)
+            .await;
+
+        if let Ok(n) = &result {
+            info!("[HC] control_transfer -> Ok({})", n);
+        } else {
+            warn!("[HC] control_transfer -> Err");
+        }
+        result
+    }
+
+    async fn bulk_in_transfer(
+        &self,
+        _address: u8,
+        _endpoint: u8,
+        _packet_size: u16,
+        _data: &mut [u8],
+        _transfer_type: TransferType,
+        _data_toggle: &Cell<bool>,
+    ) -> Result<usize, UsbError> {
+        // Phase 2b stub
+        Err(UsbError::ProtocolError)
+    }
+
+    async fn bulk_out_transfer(
+        &self,
+        _address: u8,
+        _endpoint: u8,
+        _packet_size: u16,
+        _data: &[u8],
+        _transfer_type: TransferType,
+        _data_toggle: &Cell<bool>,
+    ) -> Result<usize, UsbError> {
+        // Phase 2b stub
+        Err(UsbError::ProtocolError)
+    }
+
+    async fn alloc_interrupt_pipe(
+        &self,
+        _address: u8,
+        _transfer_extras: TransferExtras,
+        _endpoint: u8,
+        _max_packet_size: u16,
+        _interval_ms: u8,
+    ) -> Imxrt1062InterruptPipe {
+        // Phase 2c stub — just wait forever since we can't actually allocate
+        core::future::pending().await
+    }
+
+    fn try_alloc_interrupt_pipe(
+        &self,
+        _address: u8,
+        _transfer_extras: TransferExtras,
+        _endpoint: u8,
+        _max_packet_size: u16,
+        _interval_ms: u8,
+    ) -> Result<Self::InterruptPipe, UsbError> {
+        // Phase 2c stub
+        Err(UsbError::AllPipesInUse)
     }
 }
