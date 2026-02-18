@@ -1,18 +1,18 @@
 # Phase 2: Core HostController Trait Implementation
 
 **Estimated effort**: 5-7 days  
-**Key milestones**: 
-- Phase 2a: `GET_DESCRIPTOR` works (3-4 days) ✨
-- Phase 2b: USB flash drive sector read (2-3 days)
-- Phase 2c: HID keyboard input received (2-3 days)
+**Key milestones**:
+- ✅ Phase 2a: `GET_DESCRIPTOR` works (3-4 days)
+- ✅ Phase 2b: HID keyboard input received (2-3 days) — COMPLETE, working on hardware
+- Phase 2c: USB flash drive sector read (2-3 days)
 
 ## Sub-phase → Section Mapping
 
 | Sub-phase | Sections | Scope |
 |-----------|----------|-------|
 | **2a** | 2.1, 2.2, 2.3 | Device detection, port reset, control transfers |
-| **2b** | 2.5 | Bulk IN/OUT transfers |
-| **2c** | 2.4 | Interrupt pipe allocation and streaming |
+| **2b** | 2.4 | Interrupt pipe allocation and streaming |
+| **2c** | 2.5 | Bulk IN/OUT transfers |
 
 ## 2.1 Device Detection (`device_detect()` → `Imxrt1062DeviceDetect`)
 
@@ -92,9 +92,39 @@
 
 ## 2.4 Interrupt Endpoint Support (`alloc_interrupt_pipe()` / `try_alloc_interrupt_pipe()`)
 
-- [ ] Implement `Imxrt1062InterruptPipe` as `Stream<Item = InterruptPacket> + Unpin`
-- [ ] Implement `alloc_interrupt_pipe()` — async version (waits for pipe availability)
-- [ ] Implement `try_alloc_interrupt_pipe()` — sync version (returns `Err(UsbError::AllPipesInUse)` if full)
+**Status**: ✅ COMPLETE — working on hardware (HID keyboard reports received)
+
+- [x] Implement `Imxrt1062InterruptPipe` as `Stream<Item = InterruptPacket> + Unpin`
+- [x] Implement `alloc_interrupt_pipe()` — async version (waits for pipe availability)
+- [x] Implement `try_alloc_interrupt_pipe()` — sync version (returns `Err(UsbError::AllPipesInUse)` if full)
+
+### Implementation Notes (as built)
+
+- **QH index mapping**: `bulk_pipes` pool tokens 0,1,2 → `Pipe::new(token, 1)` → `which()` = 1,2,3 → QH index = `which+1` = 2,3,4 → recv_buf = `which-1` = 0,1,2 → waker = `which` = 1,2,3
+- **Data toggle**: DTC=0 (hardware-managed) to preserve toggle across re-arms. New method `reattach_qtd_preserve_toggle` updates `overlay_next` without clearing `overlay_token`.
+- **Periodic schedule**: Flat — all 32 frame list entries point to the same QH chain head. Insert at head, update all entries.
+- **Drop safety**: 1ms busy-wait after frame list unlink before freeing QH/qTD resources.
+- **Disable-on-handle**: ISR masks UPIE (periodic interrupt, bit 19) after periodic interrupt; `poll_next` re-enables before returning `Pending`.
+- **Pool size fix**: `bulk_pipes: Pool::new((NUM_QH-1) as u8)` = 3 slots (corrected from NUM_QH=4 which would have caused OOB QH access).
+- **Static recv buffers**: `recv_bufs: [[u8; 64]; NUM_QH-1]` in `UsbStatics` provides DMA-stable addresses.
+- **Example**: `rtic_usb_hid_keyboard.rs` uses `UsbBus::get_configuration()` + `UsbBus::configure()` + `UsbBus::interrupt_endpoint_in()` high-level API.
+
+### Expected hardware test output
+
+```text
+=== imxrt-usbh: HID Keyboard Example ===
+USB2 PLL locked
+VBUS power enabled
+USB host controller initialised
+USB_OTG2 ISR installed (NVIC priority 0xE0)
+Entering device event loop...
+DeviceEvent::Connect  addr=1  VID=045e PID=00db class=0 subclass=0
+Found HID interface: iface=0 ep=1 mps=8 interval=10
+Opening interrupt IN stream...
+HID report [8]: 00 00 00 00 00 00 00 00
+HID report [8]: 00 00 04 00 00 00 00 00
+HID report [8]: 00 00 00 00 00 00 00 00
+```
 
 ### Interrupt Pipe Lifecycle
 
@@ -170,8 +200,8 @@
 **Problem**: EHCI uses hardware-managed linked lists of descriptors (QH/qTD) with DMA, vs RP2040's simple register-based SIE. The learning curve is steep.
 
 **Solution**:
-- Start with async schedule only (control + bulk). This is the simpler half of EHCI.
-- Periodic schedule (interrupt pipes) comes second.
+- Start with async schedule only (control transfers, phase 2a). Periodic schedule (interrupt pipes) comes next (phase 2b), then bulk (phase 2c).
+- Bulk transfers reuse the async schedule infrastructure already built for control transfers.
 - Reference TinyUSB's EHCI driver (`src/portable/ehci/ehci.c`) — it's a clean, minimal implementation.
 - Use Linux EHCI driver (`drivers/usb/host/ehci-hcd.c`, `ehci-q.c`) as authoritative reference for edge cases.
 - Key simplification: use only one QH per active transfer (no QH reuse/sharing).
@@ -202,7 +232,7 @@
 ## Open Questions
 
 1. **Q**: Should periodic schedule use full multi-level tree or simplified flat list?
-   **A**: Start with flat list (all interrupt QHs polled every frame = 1ms). Implement tree-based scheduling only if bandwidth becomes an issue. **Decision point**: Phase 2c.
+   **A**: Start with flat list (all interrupt QHs polled every frame = 1ms). Implement tree-based scheduling only if bandwidth becomes an issue. **Decision point**: Phase 2b.
 
 2. **Q**: What frame list size should we use?
-   **A**: Start with 256 entries (1KB, requires `USBCMD[FS] = 0b10`). Smaller than the default 1024 saves memory with minimal impact on scheduling granularity. **Decision point**: Phase 2c.
+   **A**: Start with 256 entries (1KB, requires `USBCMD[FS] = 0b10`). Smaller than the default 1024 saves memory with minimal impact on scheduling granularity. **Decision point**: Phase 2b.
