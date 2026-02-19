@@ -513,11 +513,16 @@ impl Imxrt1062HostController {
         // Use modify to preserve other PORTSC1 bits.
         ral::modify_reg!(ral::usb, self.usb, PORTSC1, PP: 1);
 
-        // ---- Step 10: Enable host disconnect detection in PHY ----
+        // ---- Step 10: High-speed disconnect detection (deferred) ----
         //
-        // ENHOSTDISCONDETECT enables the PHY's high-speed disconnect detector,
-        // which is needed for the host to detect when a device is unplugged.
-        ral::write_reg!(ral::usbphy, self.usbphy, CTRL_SET, ENHOSTDISCONDETECT: 1);
+        // ENHOSTDISCONDETECT must NOT be set until a High Speed device is
+        // connected. Setting it prematurely can cause false disconnect events
+        // and interfere with FS→HS chirp negotiation during port reset.
+        // Per USBHost_t36 (ehci.cpp:405): set only after HSP=1 in PORTSC1.
+        //
+        // For now, this is handled lazily: set when we first detect HSP=1
+        // during a control transfer, cleared on device disconnect.
+        // See phase2c_debugging.md for rationale.
 
         // ---- Step 11: Enable interrupts ----
         //
@@ -852,6 +857,25 @@ impl Imxrt1062HostController {
     // EHCI error mapping
     // -----------------------------------------------------------------------
 
+    /// Return a short string describing a `UsbError` variant (for logging,
+    /// since `UsbError` does not implement `Debug` in `no_std`).
+    fn usb_error_str(e: &UsbError) -> &'static str {
+        match e {
+            UsbError::Stall => "Stall",
+            UsbError::Timeout => "Timeout",
+            UsbError::Overflow => "Overflow",
+            UsbError::BitStuffError => "BitStuffError",
+            UsbError::CrcError => "CrcError",
+            UsbError::DataSeqError => "DataSeqError",
+            UsbError::BufferTooSmall => "BufferTooSmall",
+            UsbError::AllPipesInUse => "AllPipesInUse",
+            UsbError::ProtocolError => "ProtocolError",
+            UsbError::TooManyDevices => "TooManyDevices",
+            UsbError::NoSuchEndpoint => "NoSuchEndpoint",
+            _ => "Unknown",
+        }
+    }
+
     /// Map EHCI qTD status bits to a `UsbError`.
     fn map_qtd_error(token: u32) -> UsbError {
         if token & QTD_TOKEN_HALTED != 0 {
@@ -950,6 +974,12 @@ impl Imxrt1062HostController {
             }
         };
 
+        // Log QH configuration for debugging
+        trace!("[HC] control xfer: addr={} pkt={} PORTSC1=0x{:08X} speed={} char=0x{:08X} caps=0x{:08X}",
+            address, packet_size,
+            ral::read_reg!(ral::usb, self.usb, PORTSC1),
+            speed, characteristics, capabilities);
+
         // Initialise the QH
         unsafe { (*qh).init_endpoint(characteristics, capabilities) };
 
@@ -981,10 +1011,24 @@ impl Imxrt1062HostController {
         unsafe { (*setup_qtd).init(setup_token, setup_bytes, 8) };
 
         // Data qTD (if present)
+        //
+        // For IN control transfers, the data qTD's Total Bytes must be capped
+        // to wLength from the setup packet. cotton-usb-host may pass a buffer
+        // larger than wLength (e.g., 18-byte buffer with wLength=8 for initial
+        // GET_DESCRIPTOR). If Total Bytes exceeds wLength, the EHCI controller
+        // will issue additional IN tokens after the device has sent all its data,
+        // causing the device to STALL.
         let data_len: usize;
         match data_phase {
             DataPhase::In(ref buf) => {
-                data_len = buf.len();
+                // Cap transfer size to wLength to avoid requesting more data
+                // than the device will send.
+                let wlength = setup.wLength as usize;
+                data_len = if wlength > 0 && wlength < buf.len() {
+                    wlength
+                } else {
+                    buf.len()
+                };
                 let data_qtd = unsafe { self.qtd_mut(data_qtd_idx.unwrap()) };
                 let data_token =
                     ehci::qtd_token(PID_IN, data_len as u32, true, false);
@@ -1077,6 +1121,7 @@ impl Imxrt1062HostController {
             status_qtd: status_qtd as *const TransferDescriptor,
             data_qtd: data_qtd_idx.map(|i| &self.statics.qtd_pool[i] as *const TransferDescriptor),
             qh: qh as *const QueueHead,
+            waker_index: 0, // control pipe uses waker slot 0
         }
         .await;
 
@@ -1112,7 +1157,25 @@ impl Imxrt1062HostController {
                     DataPhase::None => Ok(0),
                 }
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                // Log raw qTD tokens for diagnosis
+                Self::cache_clean_qtd(setup_qtd);
+                let setup_token = unsafe { (*setup_qtd).token.read() };
+                let status_token = unsafe { (*status_qtd).token.read() };
+                let data_token_val = data_qtd_idx.map(|idx| {
+                    let dq = &self.statics.qtd_pool[idx];
+                    Self::cache_clean_qtd(dq);
+                    dq.token.read()
+                }).unwrap_or(0);
+                let portsc = ral::read_reg!(ral::usb, self.usb, PORTSC1);
+                debug!("[HC] control xfer FAILED: err={} setup_tok=0x{:08X} data_tok=0x{:08X} status_tok=0x{:08X} PORTSC1=0x{:08X}",
+                    Self::usb_error_str(&e),
+                    setup_token,
+                    data_token_val,
+                    status_token,
+                    portsc);
+                Err(e)
+            }
         };
 
         // ---- Free resources ----
@@ -1128,6 +1191,226 @@ impl Imxrt1062HostController {
         }
 
         bytes_transferred
+    }
+
+    // -----------------------------------------------------------------------
+    // Bulk transfer implementation
+    // -----------------------------------------------------------------------
+
+    /// Perform an EHCI bulk transfer (IN or OUT) on the async schedule.
+    ///
+    /// Uses one qTD for transfers up to ~20 KB. Data toggle is hardware-managed
+    /// (DTC=0 in QH) and tracked across calls via the `data_toggle` Cell.
+    ///
+    /// For VariableSize OUT transfers where `data_len` is an exact multiple of
+    /// `packet_size`, an extra zero-length qTD is chained to signal end-of-transfer
+    /// per USB 2.0 §5.8.
+    ///
+    /// # Safety (internal)
+    /// `data` must be valid for `data_len` bytes and DMA-accessible (not DTCM).
+    #[allow(clippy::too_many_arguments)]
+    async fn do_bulk_transfer(
+        &self,
+        address: u8,
+        endpoint: u8,
+        packet_size: u16,
+        data: *mut u8,
+        data_len: usize,
+        pid: u32,
+        is_in: bool,
+        transfer_type: TransferType,
+        data_toggle: &Cell<bool>,
+    ) -> Result<usize, UsbError> {
+        // 1. Allocate a pipe from the bulk_pipes pool.
+        let pipe = Pipe::new(self.statics.bulk_pipes.alloc().await, 1);
+        let qh_index = pipe.which() as usize + 1;
+        let waker_idx = pipe.which() as usize;
+
+        // 2. Determine port speed.
+        let speed = match self.port_speed() {
+            0 => SPEED_FULL,
+            1 => SPEED_LOW,
+            2 => SPEED_HIGH,
+            _ => SPEED_FULL,
+        };
+
+        // Workaround: cotton-usb-host v0.2.1 hardcodes packet_size=64 for bulk
+        // transfers (a TODO in their code). For High Speed bulk, USB 2.0 §5.8.3
+        // mandates wMaxPacketSize=512 as the only valid value. Override here.
+        let actual_packet_size = if speed == SPEED_HIGH && packet_size < 512 {
+            512
+        } else {
+            packet_size
+        };
+
+        // 3. Initialize the QH with DTC=0 (hardware manages data toggle in overlay).
+        let qh = unsafe { self.qh_mut(qh_index) };
+        let characteristics = ehci::qh_characteristics(
+            address,
+            endpoint,
+            speed,
+            actual_packet_size,
+            false, // not a control endpoint → DTC=0
+            false, // not head of reclamation list
+        );
+        let capabilities = ehci::qh_capabilities(0, 0, 0, 0, 1);
+        unsafe { (*qh).init_endpoint(characteristics, capabilities) };
+
+        // 4. Determine if a ZLP is needed.
+        // Per USB 2.0 §5.8: a VariableSize OUT transfer that fills an exact number
+        // of packets must append a zero-length packet to signal end-of-transfer.
+        let need_zlp = !is_in
+            && transfer_type == TransferType::VariableSize
+            && data_len > 0
+            && actual_packet_size as usize > 0
+            && data_len % actual_packet_size as usize == 0;
+
+        // 5. Allocate qTD(s). Free on error to avoid leaking pool entries.
+        let data_qtd_idx = self.alloc_qtd().ok_or(UsbError::AllPipesInUse)?;
+        let zlp_qtd_idx = if need_zlp {
+            Some(self.alloc_qtd().ok_or_else(|| {
+                unsafe { self.free_qtd(data_qtd_idx) };
+                UsbError::AllPipesInUse
+            })?)
+        } else {
+            None
+        };
+
+        // 6. Initialize the data qTD. IOC is set on the last qTD in the chain.
+        let data_qtd = unsafe { self.qtd_mut(data_qtd_idx) };
+        let data_token = ehci::qtd_token(pid, data_len as u32, false, !need_zlp);
+        unsafe { (*data_qtd).init(data_token, data as *const u8, data_len as u32) };
+
+        // 7. If a ZLP is needed: initialize the ZLP qTD and chain data → ZLP.
+        if let Some(zlp_idx) = zlp_qtd_idx {
+            let zlp_qtd = unsafe { self.qtd_mut(zlp_idx) };
+            let zlp_token = ehci::qtd_token(pid, 0, false, true); // IOC on ZLP
+            unsafe { (*zlp_qtd).init(zlp_token, core::ptr::null(), 0) };
+            // Chain: data qTD → ZLP qTD
+            unsafe { (*data_qtd).next.write(zlp_qtd as u32) };
+        }
+
+        // 8. Attach first qTD to QH. attach_qtd() clears overlay_token to 0;
+        //    then set the initial data toggle bit per data_toggle.get().
+        unsafe { (*qh).attach_qtd(data_qtd) };
+        if data_toggle.get() {
+            unsafe { (*qh).set_overlay_toggle(true) };
+        }
+
+        // 9. For OUT: clean the outgoing data buffer before DMA starts.
+        if !is_in && data_len > 0 {
+            Self::cache_clean_buffer(data as *const u8, data_len);
+        }
+
+        // 10. Clean qTDs, QH, and sentinel; link to async schedule; re-clean.
+        Self::cache_clean_qtd(data_qtd);
+        if let Some(zlp_idx) = zlp_qtd_idx {
+            Self::cache_clean_qtd(unsafe { self.qtd_mut(zlp_idx) });
+        }
+        Self::cache_clean_qh(qh);
+        let sentinel = unsafe { self.qh_mut(0) };
+        Self::cache_clean_qh(sentinel);
+
+        unsafe { self.link_qh_to_async_schedule(qh) };
+
+        // Re-clean after linking (horizontal_links of both qh and sentinel changed).
+        Self::cache_clean_qh(qh);
+        Self::cache_clean_qh(sentinel);
+
+        self.enable_async_schedule();
+
+        // 11. Determine which qTD has IOC (status_qtd) and optional data_qtd for
+        //     byte counting. For the ZLP case, TransferComplete watches the ZLP qTD
+        //     for completion and the data qTD for early error detection.
+        let (status_qtd_ptr, data_qtd_opt) = if let Some(zlp_idx) = zlp_qtd_idx {
+            let zlp_ptr = unsafe { self.qtd_mut(zlp_idx) as *const TransferDescriptor };
+            (zlp_ptr, Some(data_qtd as *const TransferDescriptor))
+        } else {
+            (data_qtd as *const TransferDescriptor, None)
+        };
+
+        // 12. Poll for transfer completion.
+        let result = TransferComplete {
+            usb: &self.usb,
+            shared: self.shared,
+            status_qtd: status_qtd_ptr,
+            data_qtd: data_qtd_opt,
+            qh: qh as *const QueueHead,
+            waker_index: waker_idx,
+        }
+        .await;
+
+        // 13. Compute the byte count from the transfer result.
+        if let Err(ref e) = result {
+            // Read the raw qTD token and QH for diagnosis.
+            cache::clean_invalidate_dcache_by_address(
+                data_qtd as usize,
+                core::mem::size_of::<TransferDescriptor>(),
+            );
+            cache::clean_invalidate_dcache_by_address(
+                qh as usize,
+                core::mem::size_of::<QueueHead>(),
+            );
+            let raw_token = unsafe { (*data_qtd).token.read() };
+            let buf0 = unsafe { (*data_qtd).buffer[0].read() };
+            let qh_char = unsafe { (*qh).characteristics.read() };
+            let qh_overlay_tok = unsafe { (*qh).overlay_token.read() };
+            debug!(
+                "[HC] bulk {} addr={} ep={} len={} -> Err({}) token=0x{:08X} buf0=0x{:08X} char=0x{:08X} overlay=0x{:08X}",
+                if is_in { "IN" } else { "OUT" },
+                address,
+                endpoint,
+                data_len,
+                Self::usb_error_str(e),
+                raw_token,
+                buf0,
+                qh_char,
+                qh_overlay_tok,
+            );
+        }
+        let byte_result: Result<usize, UsbError> = match result {
+            Ok(()) => {
+                if is_in {
+                    // Invalidate the IN data buffer (DMA wrote to it; don't write back).
+                    if data_len > 0 {
+                        cache::invalidate_dcache_by_address(data as usize, data_len);
+                    }
+                    // Invalidate+read the data qTD token to compute bytes received.
+                    Self::cache_clean_qtd(data_qtd);
+                    let token = unsafe { (*data_qtd).token.read() };
+                    let remaining = ehci::qtd_token_bytes_remaining(token) as usize;
+                    Ok(data_len.saturating_sub(remaining))
+                } else {
+                    Ok(data_len)
+                }
+            }
+            Err(e) => Err(e),
+        };
+
+        // 14. Unlink QH from async schedule and ring the async advance doorbell.
+        //     This always runs — even on error — to release the QH slot cleanly.
+        unsafe { self.unlink_qh_from_async_schedule(qh) };
+        Self::cache_clean_qh(sentinel);
+        self.wait_async_advance().await;
+
+        // 15. Read the data toggle from the QH overlay for the next transfer.
+        //     The controller writes the next expected toggle into the overlay_token
+        //     DT bit (bit 31) when it updates the overlay at end-of-transfer.
+        Self::cache_clean_qh(qh);
+        let new_toggle = unsafe { (*qh).overlay_token.read() } & (1 << 31) != 0;
+        data_toggle.set(new_toggle);
+
+        // 16. Free resources.
+        unsafe {
+            self.free_qtd(data_qtd_idx);
+            if let Some(zlp_idx) = zlp_qtd_idx {
+                self.free_qtd(zlp_idx);
+            }
+            (*qh).sw_flags.write(0);
+        }
+
+        // `pipe` drops here, returning the bulk_pipes slot to the pool.
+        byte_result
     }
 
     // -----------------------------------------------------------------------
@@ -1191,7 +1474,7 @@ impl Imxrt1062HostController {
         let recv_buf_ptr = self.statics.recv_bufs[recv_buf_idx].as_ptr();
         // DIAG Step 1: Confirm recv_buf is in DMA-accessible memory (OCRAM 0x2020_xxxx/0x2024_xxxx).
         // If address is 0x2000_xxxx (DTCM), EHCI DMA cannot write there → always zeros.
-        log::info!(
+        debug!(
             "[HC] recv_buf[{}] @ 0x{:08x} (OCRAM=0x2020_0000..0x202F_FFFF, DTCM=0x2000_xxxx)",
             recv_buf_idx,
             recv_buf_ptr as u32,
@@ -1222,7 +1505,7 @@ impl Imxrt1062HostController {
             core::mem::size_of::<ehci::FrameList>(),
         );
 
-        info!(
+        debug!(
             "[HC] interrupt pipe allocated: addr={} ep={} mps={} qh={} qtd={}",
             address, endpoint, max_packet_size, qh_index, qtd_index
         );
@@ -1256,14 +1539,16 @@ struct TransferComplete<'a> {
     status_qtd: *const TransferDescriptor,
     data_qtd: Option<*const TransferDescriptor>,
     qh: *const QueueHead,
+    /// Index into `pipe_wakers` to register with. 0 = control pipe; 1..N = bulk/interrupt.
+    waker_index: usize,
 }
 
 impl Future for TransferComplete<'_> {
     type Output = Result<(), UsbError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Register waker with pipe 0 (control pipe)
-        self.shared.pipe_wakers[0].register(cx.waker());
+        // Register waker with the appropriate pipe waker slot.
+        self.shared.pipe_wakers[self.waker_index].register(cx.waker());
 
         // Invalidate cache to see hardware updates
         Imxrt1062HostController::cache_clean_qtd(self.status_qtd);
@@ -1429,7 +1714,7 @@ impl Stream for Imxrt1062DeviceDetect {
                 addr: self.usb as *mut _,
             };
             let portsc = ral::read_reg!(ral::usb, usb_instance, PORTSC1);
-            info!("[HC] DeviceDetect: status change  PORTSC1=0x{:08X}", portsc);
+            debug!("[HC] DeviceDetect: status change  PORTSC1=0x{:08X}", portsc);
             self.reenable_interrupt();
             self.status = device_status;
             Poll::Ready(Some(device_status))
@@ -1552,7 +1837,7 @@ impl Stream for Imxrt1062InterruptPipe {
         // H1 (DTCM): bytes always 00 even with key held.
         // H3 (Error): token bit6=Halted or bit3=XACT_ERR, remaining=mps (0 bytes transferred).
         // Working: token=0x0000_0000, remaining=0, non-zero bytes on key press.
-        log::info!(
+        debug!(
             "[HC] qTD done: token=0x{:08x} rem={} buf=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
             token,
             ehci::qtd_token_bytes_remaining(token),
@@ -1711,37 +1996,57 @@ impl HostController for Imxrt1062HostController {
             .await;
 
         if let Ok(n) = &result {
-            info!("[HC] control_transfer -> Ok({})", n);
-        } else {
-            warn!("[HC] control_transfer -> Err");
+            trace!("[HC] control_transfer -> Ok({})", n);
+        } else if let Err(ref e) = result {
+            warn!("[HC] control_transfer -> Err({})", Self::usb_error_str(e));
         }
         result
     }
 
     async fn bulk_in_transfer(
         &self,
-        _address: u8,
-        _endpoint: u8,
-        _packet_size: u16,
-        _data: &mut [u8],
-        _transfer_type: TransferType,
-        _data_toggle: &Cell<bool>,
+        address: u8,
+        endpoint: u8,
+        packet_size: u16,
+        data: &mut [u8],
+        transfer_type: TransferType,
+        data_toggle: &Cell<bool>,
     ) -> Result<usize, UsbError> {
-        // Phase 2b stub
-        Err(UsbError::ProtocolError)
+        self.do_bulk_transfer(
+            address,
+            endpoint,
+            packet_size,
+            data.as_mut_ptr(),
+            data.len(),
+            PID_IN,
+            true,
+            transfer_type,
+            data_toggle,
+        )
+        .await
     }
 
     async fn bulk_out_transfer(
         &self,
-        _address: u8,
-        _endpoint: u8,
-        _packet_size: u16,
-        _data: &[u8],
-        _transfer_type: TransferType,
-        _data_toggle: &Cell<bool>,
+        address: u8,
+        endpoint: u8,
+        packet_size: u16,
+        data: &[u8],
+        transfer_type: TransferType,
+        data_toggle: &Cell<bool>,
     ) -> Result<usize, UsbError> {
-        // Phase 2b stub
-        Err(UsbError::ProtocolError)
+        self.do_bulk_transfer(
+            address,
+            endpoint,
+            packet_size,
+            data.as_ptr() as *mut u8,
+            data.len(),
+            PID_OUT,
+            false,
+            transfer_type,
+            data_toggle,
+        )
+        .await
     }
 
     async fn alloc_interrupt_pipe(

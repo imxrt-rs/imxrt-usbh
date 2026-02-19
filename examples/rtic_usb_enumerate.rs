@@ -312,18 +312,13 @@ mod app {
     // USB1 ISR (for logging)
     // -----------------------------------------------------------------------
 
-    #[task(binds = BOARD_USB1, priority = 1)]
-    fn usb1_interrupt(_cx: usb1_interrupt::Context) {
-        poll_logger::spawn().ok();
+    #[task(binds = BOARD_USB1, shared = [poller], priority = 2)]
+    fn usb1_interrupt(mut cx: usb1_interrupt::Context) {
+        cx.shared.poller.lock(|poller| poller.poll());
     }
 
-    #[task(binds = BOARD_DMA_A, priority = 1)]
-    fn dma_interrupt(_cx: dma_interrupt::Context) {
-        poll_logger::spawn().ok();
-    }
-
-    #[task(shared = [poller], priority = 1)]
-    async fn poll_logger(mut cx: poll_logger::Context) {
+    #[task(binds = BOARD_DMA_A, shared = [poller], priority = 2)]
+    fn dma_interrupt(mut cx: dma_interrupt::Context) {
         cx.shared.poller.lock(|poller| poller.poll());
     }
 

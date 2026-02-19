@@ -4,7 +4,7 @@
 **Key milestones**:
 - ✅ Phase 2a: `GET_DESCRIPTOR` works (3-4 days)
 - ✅ Phase 2b: HID keyboard input received (2-3 days) — COMPLETE, working on hardware
-- Phase 2c: USB flash drive sector read (2-3 days)
+- ✅ Phase 2c: USB flash drive sector read (2-3 days) — COMPLETE, working on hardware
 
 ## Sub-phase → Section Mapping
 
@@ -163,76 +163,144 @@ HID report [8]: 00 00 00 00 00 00 00 00
 
 ## 2.5 Bulk Transfers (`bulk_in_transfer()` / `bulk_out_transfer()`)
 
-- [ ] Implement `bulk_in_transfer()` method
-- [ ] Implement `bulk_out_transfer()` method
+✅ **COMPLETE (Phase 2c)** — bulk IN/OUT working on hardware (MSC sector read confirmed).
 
-### Bulk IN Transfer Flow
+- [x] Add `set_overlay_toggle()` to `QueueHead` in `ehci.rs`
+- [x] Add `waker_index` field to `TransferComplete` future (was hardcoded to 0 / control pipe)
+- [x] Implement `do_bulk_transfer()` shared implementation
+- [x] Implement `bulk_in_transfer()` — delegates to `do_bulk_transfer` with `PID_IN, is_in=true`
+- [x] Implement `bulk_out_transfer()` — delegates to `do_bulk_transfer` with `PID_OUT, is_in=false`
+- [x] Create `examples/rtic_usb_mass_storage.rs` — CBW/CSW READ(10) test via `UsbBus` API
+- [x] Hardware validation: sector 0 read confirmed on flash drive
 
-1. Allocate pipe from `statics.bulk_pipes` pool
-2. Build qTD(s) for incoming data: PID = IN, buffer → caller's `data` slice, IOC = 1
-   - For large transfers: chain multiple qTDs (each can reference up to 5 × 4KB = 20KB via 5 buffer pointers)
-   - Set data toggle from `data_toggle: &Cell<bool>` parameter
-3. Configure QH: device address, endpoint, max packet size, bulk type
-4. Flush caches, link QH to async schedule
-5. Wait for completion (same pattern as control transfer)
-6. On success: update `data_toggle` cell, return bytes transferred
-   - `TransferType::VariableSize` — a short packet (< max_packet_size) signals end of transfer, return actual bytes
-   - `TransferType::FixedSize` — expect exactly `data.len()` bytes, short packet is an error
-7. Unlink QH (async advance doorbell), free resources
+### Design Decisions
 
-### Bulk OUT Transfer Flow
+| Area | Decision | Rationale |
+|------|----------|-----------|
+| Data toggle | DTC=0 in QH (hardware-managed) | Same as interrupt pipe; overlay_token[31] tracks across transfers |
+| Toggle initialisation | `set_overlay_toggle()` after `attach_qtd()` | `attach_qtd()` clears overlay_token to 0; must set toggle bit before cache clean |
+| Toggle readback | Read `overlay_token bit 31` after async advance doorbell | Reflects next expected toggle; update `data_toggle.set()` |
+| qTD count | Single qTD per transfer (up to 5 × 4 KB = ~20 KB) | Sufficient for 512-byte sector reads; no chaining needed |
+| ZLP handling | Chain a 0-byte qTD when `!is_in && VariableSize && data_len > 0 && data_len % packet_size == 0` | USB 2.0 §5.8: host must append ZLP when data exactly fills packet count |
+| IN buffer cache | `cache::invalidate_dcache_by_address` (DCIMVAC) after transfer | Invalidate-only — avoids writing stale dirty lines over DMA-written data |
+| OUT buffer cache | `cache_clean_buffer()` before schedule link | Flushes CPU writes to RAM before DMA reads |
+| waker index | `pipe.which() as usize` (= 1, 2, or 3) | Per-pipe waker; avoids spurious wakes; matches interrupt pipe convention |
+| QH pool index | `pipe.which() as usize + 1` (= 2, 3, or 4) | Index 0 = sentinel, 1 = control; bulk/interrupt share indices 2–4 |
+| `TransferComplete` reuse | Yes — `waker_index` field added | Avoids duplicating polling / error-mapping logic from control transfers |
 
-1. Same structure as IN but: PID = OUT, buffer → caller's `data` slice
-2. Handle ZLP (Zero Length Packet) if data length is a multiple of max packet size (per USB 2.0 spec)
-3. Data toggle management same as IN
+### `do_bulk_transfer` Step-by-Step
 
-### Data Toggle Notes
+1. `Pipe::new(bulk_pipes.alloc().await, 1)` — acquires a pool slot; `qh_index = which+1`, `waker_idx = which`
+2. Read `PORTSC1[PSPD]` for port speed
+3. `init_endpoint(qh_characteristics(addr, ep, speed, mps, is_control=false, is_head=false))` — DTC=0
+4. Compute `need_zlp = !is_in && VariableSize && data_len > 0 && mps > 0 && data_len % mps == 0`
+5. `alloc_qtd()` for data qTD; if `need_zlp`, `alloc_qtd()` for ZLP qTD (free data qTD on failure)
+6. `qtd_token(pid, data_len, dt=false, ioc=!need_zlp)` → `data_qtd.init(token, data, data_len)`
+7. If ZLP: `qtd_token(pid, 0, dt=false, ioc=true)` → `zlp_qtd.init(..., null, 0)`; chain `data_qtd.next = zlp_qtd`
+8. `qh.attach_qtd(data_qtd)` — clears `overlay_token` to 0; then `set_overlay_toggle(data_toggle.get())`
+9. OUT only: `cache_clean_buffer(data, data_len)` — flush outgoing data to RAM
+10. Clean qTD(s), QH, sentinel; `link_qh_to_async_schedule(qh)`; re-clean QH + sentinel; `enable_async_schedule()`
+11. `TransferComplete { status_qtd, data_qtd_opt, waker_index: waker_idx }.await`
+    - ZLP case: `status_qtd = zlp_qtd`, `data_qtd = Some(data_qtd)` (for early halted detection)
+    - Normal case: `status_qtd = data_qtd`, `data_qtd = None`
+12. IN + success: `cache::invalidate_dcache_by_address(data, data_len)`; `cache_clean_qtd(data_qtd)`; `received = data_len - qtd_token_bytes_remaining(token)`
+13. OUT + success: `received = data_len`
+14. `unlink_qh_from_async_schedule(qh)`; `cache_clean_qh(sentinel)`; `wait_async_advance().await`
+15. `cache_clean_qh(qh)`; `new_toggle = overlay_token.read() & (1<<31) != 0`; `data_toggle.set(new_toggle)`
+16. `free_qtd(data_qtd_idx)` [+ `free_qtd(zlp_qtd_idx)`]; `qh.sw_flags = 0`; pipe drops → pool slot freed
+17. Return `Ok(received)` or `Err(e)`
 
-- The `data_toggle: &Cell<bool>` is managed by the caller across transfers
-- EHCI QH can track data toggle in hardware (overlay `token[DT]` bit)
-- Set `DTC = 0` in QH endpoint characteristics to let QH track toggle, OR `DTC = 1` to take toggle from qTD
-- For bulk: use `DTC = 0` (QH tracks toggle), initialize QH overlay toggle from `data_toggle.get()`, and read it back after transfer completes to update `data_toggle.set()`
+### `TransferType` Handling
 
-## Challenges for This Phase
+`TransferType` is passed by `UsbBus` but currently affects only OUT transfers:
 
-### Challenge: EHCI Complexity vs RP2040 Simplicity
+- **OUT / VariableSize**: ZLP appended when `data_len % packet_size == 0` (see step 4 above).
+- **OUT / FixedSize**: No ZLP — the receiver knows the transfer length out-of-band.
+- **IN / VariableSize or FixedSize**: Both return `data_len - bytes_remaining` from the qTD token. EHCI will stop on a short packet (device sends fewer bytes than `total_bytes` in the qTD), so the actual received count is always correct. `TransferType` does not change IN behaviour at the EHCI level.
+
+### Known Limitation: UsbBus Hardcodes MPS=64
+
+`UsbBus::bulk_in_transfer` and `bulk_out_transfer` pass `packet_size=64` regardless of the device's actual bulk packet size (marked `@TODO` in cotton-usb-host source). This affects only the QH `max_packet_size` field, not data correctness — EHCI automatically issues multiple 64-byte transactions until the `qTD total_bytes` count is satisfied. For a flash drive with 512-byte sectors over a full-speed connection (64-byte max bulk packet), EHCI will issue 8 transactions of 64 bytes each per sector read, which is correct.
+
+### Risks
+
+- **Toggle readback timing**: `overlay_token` is read after the async advance doorbell. If the hardware has cleared the overlay between transfer completion and the doorbell acknowledgement, the toggle could be wrong. Mitigation: if toggle errors appear on hardware, read the last qTD's own DT bit (`qtd.token >> 31`) instead, which is stable after completion. To be verified on hardware.
+- **ZLP on zero-length OUT**: If `data_len == 0` is passed for a VariableSize OUT, the condition `data_len > 0` in `need_zlp` prevents a spurious extra ZLP. The single data qTD sends a natural ZLP.
+
+### Expected Hardware Test Results (`rtic_usb_mass_storage`)
+
+Flash `rtic_usb_mass_storage.hex` with a USB flash drive connected to the USB2 host port.
+
+```
+=== imxrt-usbh: USB Mass Storage Example ===
+USB2 PLL locked
+VBUS power enabled
+USB host controller initialised
+USB_OTG2 ISR installed (NVIC priority 0xE0)
+Entering device event loop...
+DeviceEvent::Connect  addr=1  VID=xxxx PID=xxxx class=0
+Found MSC interface: class=8 sub=6 proto=0x50 bulk_in=1 (mps=64) bulk_out=2 (mps=64)
+Opening bulk endpoints...
+Sending CBW READ(10) LBA=0...
+CBW sent: 31 bytes
+Data received: 512 bytes
+Sector 0: eb 58 90 4e 54 46 53 20 20 20 20 00 02 08 00 00
+CSW: status=0 (success)
+```
+
+The first bytes of sector 0 identify the filesystem: `eb 58 90 4e 54 46 53` = NTFS boot sector,
+`eb 58 90 45 58 46 41 54` = exFAT, `eb 3c 90 4d 53 44 4f 53` = FAT32. A blank/unformatted drive
+shows `00 00 00 ...`.
+
+After this test passes, also re-run `rtic_usb_hid_keyboard` to confirm interrupt pipes still work
+correctly — `do_bulk_transfer` shares the `bulk_pipes` pool and QH slots with interrupt pipes, so
+concurrent correctness should be verified.
+
+## Challenges Encountered and Resolutions
+
+### ✅ Challenge: EHCI Complexity vs RP2040 Simplicity
 
 **Problem**: EHCI uses hardware-managed linked lists of descriptors (QH/qTD) with DMA, vs RP2040's simple register-based SIE. The learning curve is steep.
 
-**Solution**:
-- Start with async schedule only (control transfers, phase 2a). Periodic schedule (interrupt pipes) comes next (phase 2b), then bulk (phase 2c).
-- Bulk transfers reuse the async schedule infrastructure already built for control transfers.
-- Reference TinyUSB's EHCI driver (`src/portable/ehci/ehci.c`) — it's a clean, minimal implementation.
-- Use Linux EHCI driver (`drivers/usb/host/ehci-hcd.c`, `ehci-q.c`) as authoritative reference for edge cases.
-- Key simplification: use only one QH per active transfer (no QH reuse/sharing).
+**Resolution**: Built strictly incrementally — async schedule (control, Phase 2a) → periodic schedule (interrupt, Phase 2b) → bulk reuses async (Phase 2c). Used TinyUSB as a clean reference and Linux EHCI driver for edge cases. Key simplification: one QH per active transfer, no QH reuse/sharing.
 
-### Challenge: Periodic Schedule Setup
+### ✅ Challenge: Periodic Schedule Setup (Phase 2b)
 
-**Problem**: Interrupt endpoints require the EHCI periodic schedule — a frame list in memory with QH pointers organized by polling interval.
+**Problem**: Interrupt endpoints require the EHCI periodic schedule.
 
-**Solution**:
-- **Initially**: Simplified periodic schedule — 1024-entry frame list, all entries point to same QH chain (effectively 1ms polling for all interrupt endpoints regardless of requested interval)
-- **Later**: Proper interval-based scheduling with binary tree structure
-- Frame list must be 4KB-aligned (1024 entries × 4 bytes)
-- Alternatively, use smaller frame list (256 entries) with `USBCMD[FS]` bits to save memory
-- Link interrupt QHs into the frame list; they form a linked list per frame via `horizontal_link`
+**Resolution**: Implemented simplified flat schedule — 32-entry frame list (all entries point to the same QH chain head), giving 1 ms effective polling for all interrupt endpoints regardless of requested interval. `FRAME_LIST_LEN = 32`, frame list size encoding `FS[2:0] = 0b101`. This is sufficient for keyboard-class devices. Proper binary-tree interval scheduling is deferred to a future phase.
 
-### Challenge: Async Schedule QH Removal
+### ✅ Challenge: Async Schedule QH Removal
 
-**Problem**: You cannot simply unlink a QH from the async schedule — the hardware may be actively reading it. Premature removal causes undefined behavior.
+**Problem**: Cannot directly unlink a QH — hardware may be actively reading it.
 
-**Solution**:
-- Use EHCI's Async Advance Doorbell mechanism:
-  1. Unlink QH from the circular list (point previous QH's `horizontal_link` around it)
-  2. Set `USBCMD[IAA]` (Interrupt on Async Advance doorbell)
-  3. Wait for `USBSTS[AAI]` interrupt — this guarantees the hardware has advanced past the removed QH
-  4. Now it's safe to free/reuse the QH
-- Implement an `async_advance_waker` in `UsbShared` for this purpose
+**Resolution**: Implemented `AsyncAdvanceWait` future using EHCI's Async Advance Doorbell:
+1. Unlink QH (update predecessor's `horizontal_link`)
+2. Set `USBCMD[IAA]`
+3. Await `USBSTS[AAI]` via `async_advance_waker`
+4. Safe to free QH/qTD resources
+
+### ✅ Challenge: Cache Coherency for DMA (Cortex-M7 D-cache)
+
+**Problem**: Cortex-M7 D-cache is write-back. CPU writes to QH/qTD/buffers are not visible to the DMA engine until cleaned; DMA writes to IN buffers are not visible to the CPU until invalidated.
+
+**Resolution** (established in Phase 2b, reused in 2c):
+- Before DMA reads (qTD, QH, OUT data buffer): `clean_invalidate_dcache_by_address` (DCCIMVAC)
+- After DMA writes (IN data buffer): `invalidate_dcache_by_address` (DCIMVAC) — invalidate-only, never clean+invalidate, to avoid writing stale cache lines over DMA-written data
+
+### ✅ Toggle Readback Reliability (Phase 2c)
+
+**Problem**: `overlay_token bit 31` is read after the async advance doorbell to capture the next expected data toggle. If the controller has already cleared the overlay to 0, this returns the wrong toggle and subsequent transfers will use the wrong DATA0/DATA1 bit, causing `DataSeqError` STALLs.
+
+**Resolution**: Toggle readback from `overlay_token` works correctly on hardware. The MSC sector read uses three consecutive bulk transfers (CBW OUT → Data IN → CSW IN) with data toggle tracking across all three, and all succeed. No toggle-related errors observed.
 
 ## Open Questions
 
 1. **Q**: Should periodic schedule use full multi-level tree or simplified flat list?
-   **A**: Start with flat list (all interrupt QHs polled every frame = 1ms). Implement tree-based scheduling only if bandwidth becomes an issue. **Decision point**: Phase 2b.
+   **A**: ✅ Resolved (Phase 2b) — Flat 32-entry list, 1 ms polling for all interrupt endpoints. Tree-based scheduling deferred until needed.
 
 2. **Q**: What frame list size should we use?
-   **A**: Start with 256 entries (1KB, requires `USBCMD[FS] = 0b10`). Smaller than the default 1024 saves memory with minimal impact on scheduling granularity. **Decision point**: Phase 2b.
+   **A**: ✅ Resolved (Phase 2b) — 32 entries (`FRAME_LIST_LEN = 32`, `FS[2:0] = 0b101`). Saves memory vs. 1024 entries; 32 ms maximum scheduling granularity is acceptable.
+
+3. **Q**: Is toggle readback from `overlay_token` reliable after async advance doorbell?
+   **A**: ✅ Resolved (Phase 2c) — works correctly. MSC CBW/Data/CSW sequence uses toggle tracking across three bulk transfers with no errors.
