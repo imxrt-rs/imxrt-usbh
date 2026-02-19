@@ -548,6 +548,23 @@ impl QueueHead {
         // overlay_token intentionally NOT written — controller manages DT bit (DTC=0)
     }
 
+    /// Set the data toggle bit in the QH overlay without disturbing other overlay fields.
+    ///
+    /// Used to initialize the hardware-managed toggle (DTC=0) before a bulk transfer.
+    /// Must be called after [`attach_qtd`](Self::attach_qtd) (which clears overlay_token
+    /// to 0) and before the cache clean / schedule link.
+    ///
+    /// # Safety
+    /// - `self` must be fully initialized and not currently in use by the controller.
+    pub unsafe fn set_overlay_toggle(&mut self, toggle: bool) {
+        let t = self.overlay_token.read();
+        self.overlay_token.write(if toggle {
+            t | (1 << 31)
+        } else {
+            t & !(1u32 << 31)
+        });
+    }
+
     /// Link this QH into the async schedule after `prev`.
     ///
     /// Inserts `self` between `prev` and whatever `prev` currently points to.

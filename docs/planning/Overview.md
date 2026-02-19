@@ -8,10 +8,10 @@ follows the pattern established by the RP2040 host controller implementation in
 `cotton-usb-host::host::rp2040`.
 
 
-**Document Version**: 4.4
+**Document Version**: 4.5
 **Date**: 2026-02-18
-**Status**: Phase 2b COMPLETE — HID keyboard key presses received correctly on hardware. Beginning Phase 2c.
-**Next Step**: Implement `bulk_in_transfer()` and `bulk_out_transfer()` in `src/host.rs`. Milestone: read a sector from a USB flash drive.
+**Status**: Phase 2c COMPLETE — Bulk transfers working. USB flash drive sector 0 read successfully via SCSI READ(10) over BOT protocol.
+**Next Step**: Clean up debug diagnostics, commit milestone, then Phase 3 (robustness, cache audit, polish).
 
 ## Goals
 
@@ -142,13 +142,13 @@ pub trait HostController {
 ### Phase 2: Core HostController Trait Implementation
 
 **Estimated effort**: 5-7 days  
-📄 **[Full details →](phases/phase2_host_controller_trait.md)**
+📄 **[Full details →](phase2_host_controller_trait.md)**
 
 | Sub-phase | Scope | Milestone |
 |-----------|-------|-----------|
 | **2a** (3-4 days) | Device detection, port reset, control transfers | ✅ COMPLETE — Full USB enumeration working (VID=045e PID=00db) |
 | **2b** (2-3 days) | `alloc_interrupt_pipe()`, `try_alloc_interrupt_pipe()` | ✅ COMPLETE — HID keyboard input received on hardware |
-| **2c** (2-3 days) | `bulk_in_transfer()`, `bulk_out_transfer()` | USB flash drive sector read |
+| **2c** (2-3 days) | `bulk_in_transfer()`, `bulk_out_transfer()` | ✅ COMPLETE — MSC sector read working (CBW/data/CSW) |
 
 - Implement `Imxrt1062DeviceDetect` stream (PORTSC1 monitoring, speed detection)
 - Implement `reset_root_port()` with W1C-safe register writes
@@ -160,7 +160,7 @@ pub trait HostController {
 ### Phase 3: Interrupt Handling and Async Support
 
 **Estimated effort**: 2-3 days | **Milestone**: Reliable operation, no corruption  
-📄 **[Full details →](phases/phase3_interrupts_and_async.md)**
+📄 **[Full details →](phase3_interrupts_and_async.md)**
 
 - Implement `UsbShared::on_irq()` with disable-on-handle / re-enable-on-poll pattern
 - Set up waker registration: `device_waker`, `pipe_wakers[N]`, `async_advance_waker`
@@ -171,7 +171,7 @@ pub trait HostController {
 ### Phase 4: Testing and Validation
 
 **Estimated effort**: 3-5 days | **Milestone**: All device types working  
-📄 **[Full details →](phases/phase4_testing.md)**
+📄 **[Full details →](phase4_testing.md)**
 
 - Compile-time validation: struct size/alignment/offset assertions
 - 11-step incremental hardware bring-up (clock init → device detect → control → bulk → interrupt → hub)
@@ -181,7 +181,7 @@ pub trait HostController {
 ### Phase 5: Documentation and Polish
 
 **Estimated effort**: 1-2 days | **Milestone**: Complete docs and examples  
-📄 **[Full details →](phases/phase5_documentation.md)**
+📄 **[Full details →](phase5_documentation.md)**
 
 - Add `///` doc comments to all public APIs with `# Safety` and `# Panics` sections
 - Document initialization order, register alias workarounds, cache coherency requirements
@@ -309,7 +309,7 @@ pub trait HostController {
 ### i.MX RT Register Mapping Quick Reference
 
 The RAL module copied from `imxrt-usbd` provides all needed register and field definitions.
-See [imxrt-usbd-reuse-analysis.md](planning/imxrt-usbd-reuse-analysis.md) for full details.
+See [imxrt-usbd-reuse-analysis.md](agent_reports/imxrt-usbd-reuse-analysis.md) for full details.
 
 | EHCI Spec Name | RAL Name | Host-mode Field | Notes |
 |----------------|----------|-----------------|-------|
@@ -430,7 +430,7 @@ Build FAILED for example 'rtic_usb_enumerate'.
 - `ASYNCLISTADDR::ASYBASE` (bits [31:5]) is also defined for the async schedule pointer
 - `PORTSC1::PSPD` (bits [27:26]) is defined with enumerated speed values
 - All host-mode `USBCMD`/`USBSTS`/`USBINTR` fields (`ASE`, `PSE`, `HCH`, `AAI`, etc.) are present
-- See [imxrt-usbd-reuse-analysis.md](planning/imxrt-usbd-reuse-analysis.md) for the full analysis
+- See [imxrt-usbd-reuse-analysis.md](agent_reports/imxrt-usbd-reuse-analysis.md) for the full analysis
 
 ### Risk: EHCI Complexity Underestimation
 
@@ -477,7 +477,7 @@ Build FAILED for example 'rtic_usb_enumerate'.
 | **Phase 1** | **Foundation and initialization** | **2-3 days** | **✅ Controller in host mode, device detected** |
 | **Phase 2a** | **Device detect + port reset + control transfers** | **3-4 days** | **✅ COMPLETE — Full USB enumeration working (VID=045e PID=00db)** |
 | **Phase 2b** | **Interrupt pipes** | **2-3 days** | **✅ COMPLETE — HID keyboard reports received** |
-| Phase 2c | Bulk transfers | 2-3 days | USB flash drive sector read |
+| **Phase 2c** | **Bulk transfers** | **2-3 days** | **✅ COMPLETE — MSC sector read working (CBW/data/CSW)** |
 | Phase 3 | Interrupts, async, cache polish | 2-3 days | Reliable operation, no corruption |
 | Phase 4 | Testing and examples | 3-5 days | All device types working |
 | Phase 5 | Documentation | 1-2 days | Complete docs and examples |
@@ -516,19 +516,12 @@ This assumes:
 9. **Proper periodic schedule tree** — binary scheduling tree for optimal bandwidth allocation
 10. **USB hub TT (Transaction Translator) scheduling** — proper split transaction budget management
 
-## Open Questions (To Be Resolved During Implementation)
-
-Phase-specific open questions have been moved to their respective phase documents. The following are cross-cutting questions:
-
-1. **Q**: Who is responsible for USB clock/PLL initialization — this crate or the caller?
-   **A**: Follow `imxrt-hal` convention: the caller (BSP/board crate) initializes clocks, this crate takes ownership of already-clocked peripheral instances. Document the prerequisite clearly. **Decision point**: Phase 1.3.
-
 ## Notes for Future Maintainers
 
 - The **EHCI specification** (revision 1.0) is essential reading — especially sections 3.5 (qTD), 3.6 (QH), 4.8 (async schedule), 4.9 (periodic schedule)
-- **Cache coherency is the #1 source of bugs** — when in doubt, flush/invalidate. See [CACHE_COHERENCY.md](CACHE_COHERENCY.md)
+- **Cache coherency is the #1 source of bugs** — when in doubt, flush/invalidate. See [CACHE_COHERENCY.md](../design/CACHE_COHERENCY.md)
 - QH alignment (64-byte) and qTD alignment (32-byte) are enforced by hardware — the controller will silently malfunction if alignment is wrong (it ignores low-order address bits)
-- **RAL module** is copied from `imxrt-usbd/src/ral/` (not the upstream `imxrt-ral` crate). It uses `ral-registers` v0.1 for `read_reg!`/`write_reg!`/`modify_reg!` macros. See [imxrt-usbd-reuse-analysis.md](planning/imxrt-usbd-reuse-analysis.md).
+- **RAL module** is copied from `imxrt-usbd/src/ral/` (not the upstream `imxrt-ral` crate). It uses `ral-registers` v0.1 for `read_reg!`/`write_reg!`/`modify_reg!` macros. See [imxrt-usbd-reuse-analysis.md](agent_reports/imxrt-usbd-reuse-analysis.md).
 - The i.MX RT USB controller has minor quirks vs. standard EHCI:
   - `USBMODE` must be written immediately after controller reset
   - `PERIODICLISTBASE` is accessed via `DEVICEADDR::BASEADR` (host-mode field at same register offset)

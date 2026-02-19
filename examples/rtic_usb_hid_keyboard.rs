@@ -355,21 +355,21 @@ mod app {
     }
 
     // -----------------------------------------------------------------------
-    // USB1 ISR (logging)
+    // USB1 ISR (logging) — priority 2 so log flushing preempts USB task
     // -----------------------------------------------------------------------
+    //
+    // The USB host task runs at priority 1 via the BOARD_SWTASK0 dispatcher.
+    // At priority 2, USB1 and DMA interrupts preempt the USB task to flush
+    // logs promptly. We poll the logger directly in the ISR, avoiding the
+    // need for a second RTIC dispatcher.
 
-    #[task(binds = BOARD_USB1, priority = 1)]
-    fn usb1_interrupt(_cx: usb1_interrupt::Context) {
-        poll_logger::spawn().ok();
+    #[task(binds = BOARD_USB1, shared = [poller], priority = 2)]
+    fn usb1_interrupt(mut cx: usb1_interrupt::Context) {
+        cx.shared.poller.lock(|poller| poller.poll());
     }
 
-    #[task(binds = BOARD_DMA_A, priority = 1)]
-    fn dma_interrupt(_cx: dma_interrupt::Context) {
-        poll_logger::spawn().ok();
-    }
-
-    #[task(shared = [poller], priority = 1)]
-    async fn poll_logger(mut cx: poll_logger::Context) {
+    #[task(binds = BOARD_DMA_A, shared = [poller], priority = 2)]
+    fn dma_interrupt(mut cx: dma_interrupt::Context) {
         cx.shared.poller.lock(|poller| poller.poll());
     }
 
