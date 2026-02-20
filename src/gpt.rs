@@ -64,8 +64,19 @@ pub struct Gpt<'a> {
 impl<'a> Gpt<'a> {
     /// Create a GPT instance over the USB core registers.
     ///
-    /// Takes a mutable reference to prevent aliasing the same GPT instance.
-    pub(crate) fn new(usb: &'a mut ral::usb::Instance, gpt: Instance) -> Self {
+    /// Takes a mutable reference to the USB register block to prevent
+    /// aliasing the same GPT instance.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut gpt = Gpt::new(host.usb_mut(), Instance::Gpt0);
+    /// gpt.set_mode(Mode::OneShot);
+    /// gpt.set_load(50_000); // 50ms
+    /// gpt.reset();
+    /// gpt.run();
+    /// ```
+    pub fn new(usb: &'a mut ral::usb::Instance, gpt: Instance) -> Self {
         Self { usb, gpt }
     }
 
@@ -123,6 +134,11 @@ impl<'a> Gpt<'a> {
     }
 
     /// Returns the timer mode.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the hardware returns an unexpected value (should be unreachable
+    /// since the GPTMODE field is a single bit).
     pub fn mode(&self) -> Mode {
         let mode: u32 = match self.gpt {
             Instance::Gpt0 => ral::read_reg!(ral::usb, self.usb, GPTIMER0CTRL, GPTMODE),

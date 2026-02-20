@@ -1,8 +1,18 @@
 //! Register access layer for USB host mode.
 //!
-//! This module provides register definitions for the i.MX RT USB OTG controller
-//! and USB PHY peripherals. The definitions are sourced from `imxrt-usbd` and use
-//! the `ral-registers` crate for `read_reg!`/`write_reg!`/`modify_reg!` macros.
+//! These definitions are vendored from `imxrt-usbd` (which itself derives from
+//! `imxrt-ral`) because the upstream `imxrt-ral` crate models USB registers for
+//! device mode only. The EHCI host-mode registers (ASYNCLISTADDR,
+//! PERIODICLISTBASE, PORTSC1 host bits, FRINDEX, etc.) are either absent or
+//! incorrect in the SVD-generated definitions. Additionally, the [`Instance`]
+//! types here implement `Send`, which is required for sharing register access
+//! across async task boundaries and ISR contexts.
+//!
+//! If `imxrt-ral` gains proper USB host-mode support in the future, these
+//! files should be replaced with upstream imports.
+//!
+//! The `ral-registers` crate provides the `read_reg!`/`write_reg!`/`modify_reg!`
+//! macros used throughout.
 //!
 //! The USB core register block (`usb::RegisterBlock`) includes both device-mode and
 //! host-mode field definitions at the same offsets. Key host-mode mappings:

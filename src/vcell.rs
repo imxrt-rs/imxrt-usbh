@@ -1,33 +1,50 @@
-//! Volatile cell that conforms to the RAL's register API
+//! Volatile cell with interior mutability for DMA-accessible memory.
 //!
-//! `VCell` use volatile reads and writes on an owned type
-//! `T`. `VCell` does not support interior mutability, so
-//! types using `VCell` must expose mutability. (It's probably
-//! not a 'cell' then, but given it's history we'll keep the
-//! name...)
+//! `VCell` wraps a value `T` behind `UnsafeCell` and performs all reads
+//! and writes using volatile operations. This makes it suitable for
+//! EHCI DMA structures (QueueHead, TransferDescriptor, FrameList) where:
+//!
+//! - Hardware (the EHCI DMA engine) reads and writes the memory
+//! - Software needs volatile access to observe hardware changes
+//! - Both `&self` (shared) and `&mut self` access patterns are needed
+//!
+//! `VCell` is `!Sync` by default (due to `UnsafeCell`), which is correct
+//! for DMA structures — synchronization is handled by cache maintenance
+//! and EHCI schedule management.
 
+use core::cell::UnsafeCell;
 use core::ptr;
 
-/// A memory location that requires volatile reads and writes
+/// A memory location that requires volatile reads and writes.
+///
+/// Uses `UnsafeCell` internally to support interior mutability, allowing
+/// volatile writes through shared references. This is necessary for
+/// DMA structures behind `&'static` references (e.g. `UsbStatics`).
 #[repr(transparent)]
-pub struct VCell<T>(T);
+pub struct VCell<T>(UnsafeCell<T>);
 
 impl<T> VCell<T> {
     /// Construct a `VCell` that's initialized to `val`
     pub const fn new(val: T) -> Self {
-        VCell(val)
+        VCell(UnsafeCell::new(val))
     }
 }
 
 impl<T: Copy> VCell<T> {
     /// Perform a volatile read from this memory location
     pub fn read(&self) -> T {
-        // Safety: we know this memory is valid...
-        unsafe { ptr::read_volatile(&self.0) }
+        // Safety: volatile read from a valid, initialized memory location.
+        unsafe { ptr::read_volatile(self.0.get()) }
     }
     /// Perform a volatile write at this memory location
-    pub fn write(&mut self, val: T) {
-        // Safety: we know this memory is valid
-        unsafe { ptr::write_volatile(&mut self.0, val) }
+    ///
+    /// Takes `&self` (not `&mut self`) because DMA structures often need
+    /// to be written through shared references. The volatile semantics
+    /// ensure the write is not elided or reordered by the compiler.
+    pub fn write(&self, val: T) {
+        // Safety: volatile write to a valid memory location. The caller
+        // is responsible for ensuring no data races (via cache maintenance
+        // and EHCI schedule management).
+        unsafe { ptr::write_volatile(self.0.get(), val) }
     }
 }

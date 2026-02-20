@@ -13,14 +13,14 @@
 //! - **qTD**: Must be 32-byte aligned (EHCI §3.5), which also matches the Cortex-M7
 //!   cache line size (32 bytes).
 //! - **Frame List**: Must be 4096-byte aligned (page-aligned). Size is configurable
-//!   (8, 16, 32, … 1024 entries); we use [`FRAME_LIST_LEN`] entries.
+//!   (8, 16, 32, … 1024 entries); we use [`FRAME_LIST_LEN`](crate::ehci::FRAME_LIST_LEN) entries.
 //!
 //! # Cache Coherency
 //!
 //! The Cortex-M7 D-cache line size is 32 bytes. All structures in this module are
 //! DMA-visible. Every CPU read must be preceded by a cache invalidate, and every CPU
 //! write must be followed by a cache clean. Use
-//! [`crate::cache::clean_invalidate_dcache_by_address`] at DMA boundaries.
+//! `crate::cache::clean_invalidate_dcache_by_address` at DMA boundaries.
 //!
 //! # References
 //!
@@ -36,7 +36,7 @@ use crate::vcell::VCell;
 /// Terminate bit — indicates an invalid (end-of-list) pointer.
 pub const LINK_TERMINATE: u32 = 1 << 0;
 
-/// Link pointer type field values (bits [2:1]).
+/// Link pointer type field values (bits \[2:1\]).
 pub mod link_type {
     /// Isochronous Transfer Descriptor (iTD).
     pub const ITD: u32 = 0b00 << 1;
@@ -147,9 +147,9 @@ pub const QTD_TOKEN_PING_ERR: u32 = 1 << 0;
 /// Interrupt On Complete — generates an interrupt when this qTD completes.
 pub const QTD_TOKEN_IOC: u32 = 1 << 15;
 
-/// Mask for the status byte (bits [7:0]).
+/// Mask for the status byte (bits \[7:0\]).
 pub const QTD_TOKEN_STATUS_MASK: u32 = 0xFF;
-/// Mask for all error bits (bits [6:0], excludes Active).
+/// Mask for all error bits (bits \[6:0\], excludes Active).
 pub const QTD_TOKEN_ERROR_MASK: u32 = QTD_TOKEN_HALTED
     | QTD_TOKEN_BUFFER_ERR
     | QTD_TOKEN_BABBLE
@@ -161,6 +161,9 @@ const QTD_TOKEN_PID_SHIFT: u32 = 8;
 /// Bit offset for error counter in the token word.
 const QTD_TOKEN_CERR_SHIFT: u32 = 10;
 /// Bit offset for current page index in the token word.
+/// Not used by the driver (hardware manages C_Page during DMA), but kept
+/// for completeness alongside the other EHCI token field offsets.
+#[allow(dead_code)]
 const QTD_TOKEN_CPAGE_SHIFT: u32 = 12;
 /// Bit offset for total bytes to transfer in the token word.
 const QTD_TOKEN_TOTAL_BYTES_SHIFT: u32 = 16;
@@ -536,7 +539,7 @@ impl QueueHead {
 
     /// Re-attach a qTD to this QH after it completes (interrupt pipe re-arm).
     ///
-    /// Unlike [`attach_qtd`], this does **not** clear `overlay_token`, preserving
+    /// Unlike [`QueueHead::attach_qtd`], this does **not** clear `overlay_token`, preserving
     /// the data toggle managed by the controller (`DTC = 0` mode). Used to
     /// re-arm an interrupt endpoint after each received packet.
     ///
