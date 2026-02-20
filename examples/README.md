@@ -13,56 +13,80 @@ rustup component add llvm-tools
 
 ## Building
 
-Build an example and convert the ELF to an Intel HEX file:
-
-### hal_logging
-
 ```bash
-cargo build --release --target thumbv7em-none-eabihf --example hal_logging
-rust-objcopy -O ihex target/thumbv7em-none-eabihf/release/examples/hal_logging hal_logging.hex
+cargo build --release --target thumbv7em-none-eabihf --example <name>
+rust-objcopy -O ihex target/thumbv7em-none-eabihf/release/examples/<name> <name>.hex
 ```
 
-### hal_usb_host_init
+For examples that require hub support, add `--features hub-support`:
 
 ```bash
-cargo build --release --target thumbv7em-none-eabihf --example hal_usb_host_init
-rust-objcopy -O ihex target/thumbv7em-none-eabihf/release/examples/hal_usb_host_init hal_usb_host_init.hex
+cargo build --release --target thumbv7em-none-eabihf --features hub-support --example <name>
 ```
 
-## Reading log output over USB
-
-Both examples log over a USB CDC serial interface on the Teensy's programming
-USB port. After flashing, the board enumerates as a USB serial device.
-
-### hal_usb_host_init
-
-This example uses the `log` crate frontend. The output is plain text, so any
-serial monitor will work. Open the serial port at any baud rate (USB CDC
-ignores baud rate settings):
+## Flashing
 
 ```bash
-# Linux / macOS (screen, minicom, or picocom)
+teensy_loader_cli --mcu=TEENSY41 -w -v <name>.hex
+```
+
+## Reading Log Output
+
+All examples log over USB CDC serial on the Teensy's programming USB port
+(USB1). After flashing, the board enumerates as a USB serial device.
+
+All examples use plain-text logging via the `log` crate. Any serial monitor
+will work — the baud rate is ignored (USB CDC):
+
+```bash
+# Linux / macOS
 picocom /dev/ttyACM0
 
-# Windows (PuTTY, or the built-in mode command — replace COM3 with your port)
-# Open Device Manager to find the COM port number.
+# Windows — use PuTTY, or open the COM port in Device Manager
 ```
 
-### hal_logging
+## Examples
 
-This example defaults to the `defmt` frontend, which encodes log messages in a
-compact binary format. Use `defmt-print` to decode the serial stream:
+All examples use RTIC v2 and require a USB device connected to the Teensy
+4.1's USB2 host port (5-pin header) with external 5V on the VBUS pin.
+
+### rtic_usb_enumerate
+
+Device detection and enumeration. Logs VID/PID and device class on connect.
+Does not open any endpoints — useful for verifying basic USB host operation.
 
 ```bash
-cargo install defmt-print
-
-# Linux / macOS
-defmt-print -e target/thumbv7em-none-eabihf/release/examples/hal_logging < /dev/ttyACM0
-
-# Windows MingW bash (replace ttyS4 with your port - note that tty ports are zero-based, ttyS4 = COM5)
-dd if=/dev/ttyS4 bs=1 | defmt-print.exe -e target/thumbv7em-none-eabihf/release/examples/hal_logging
+cargo build --release --target thumbv7em-none-eabihf --example rtic_usb_enumerate
 ```
 
-> **Tip:** You can switch `hal_logging` to plain-text output by changing the
-> `FRONTEND` constant in the example source from `Frontend::Defmt` to
-> `Frontend::Log`, then rebuilding.
+### rtic_usb_hid_keyboard
+
+HID keyboard input (no hub support). Enumerates a keyboard, opens an interrupt
+IN pipe on its first interrupt endpoint, and logs decoded keycodes (letters,
+modifiers, and up to 3 simultaneous keys). Flashes the on-board LED in morse
+code for alphanumeric key presses. Panics if a hub is connected.
+
+```bash
+cargo build --release --target thumbv7em-none-eabihf --example rtic_usb_hid_keyboard
+```
+
+### rtic_usb_hub
+
+Hub enumeration with HID input. Connects to a USB hub, discovers devices
+behind it, and logs hub and device events. For HID devices behind the hub,
+opens an interrupt IN pipe and logs raw reports. Requires `hub-support`.
+
+```bash
+cargo build --release --target thumbv7em-none-eabihf --features hub-support --example rtic_usb_hub
+```
+
+### rtic_usb_mass_storage
+
+USB mass storage sector read. Enumerates a flash drive, finds bulk IN/OUT
+endpoints, and reads sector 0 using a raw SCSI READ(10) over Bulk-Only
+Transport (CBW/data/CSW). Logs the first 16 bytes of the sector.
+
+```bash
+cargo build --release --target thumbv7em-none-eabihf --example rtic_usb_mass_storage
+```
+

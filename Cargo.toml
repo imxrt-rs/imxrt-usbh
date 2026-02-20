@@ -22,6 +22,7 @@ optional = true
 default = ["log"]
 defmt-03 = ["dep:defmt-03"]
 log = ["dep:log"]
+hub-support = []
 
 [profile.release]
 debug = true

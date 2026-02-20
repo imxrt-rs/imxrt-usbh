@@ -38,10 +38,11 @@
 //! CSW: status=0 (success)
 //! ```
 //!
-//! # Flash
+//! # Build and flash
 //!
 //! ```sh
-//! .\build_example.ps1 -Example rtic_usb_mass_storage
+//! cargo build --release --target thumbv7em-none-eabihf --example rtic_usb_mass_storage
+//! rust-objcopy -O ihex target/thumbv7em-none-eabihf/release/examples/rtic_usb_mass_storage rtic_usb_mass_storage.hex
 //! teensy_loader_cli --mcu=TEENSY41 -w -v rtic_usb_mass_storage.hex
 //! ```
 
@@ -561,7 +562,7 @@ mod app {
                     // Step 2: Receive 512 bytes of sector data via bulk IN.
                     // Use a static buffer so it's not in DTCM (DMA-accessible).
                     static mut SECTOR_BUF: [u8; 512] = [0u8; 512];
-                    let sector_buf = unsafe { &mut SECTOR_BUF };
+                    let sector_buf = unsafe { &mut *core::ptr::addr_of_mut!(SECTOR_BUF) };
 
                     match bus.bulk_in_transfer(&ep_in, sector_buf, TransferType::FixedSize).await {
                         Ok(n) => {

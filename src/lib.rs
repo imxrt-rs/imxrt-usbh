@@ -26,11 +26,29 @@
 mod log;
 
 mod cache;
+
+/// EHCI data structures: Queue Heads, Transfer Descriptors, and frame lists.
+///
+/// These are the hardware-defined DMA structures that the EHCI controller
+/// reads and writes directly. See the EHCI specification sections 3.5 (qTD)
+/// and 3.6 (QH) for the canonical layout.
 pub mod ehci;
+
+/// USB host controller driver and supporting types.
+///
+/// Start here: [`Imxrt1062HostController`](crate::host::Imxrt1062HostController) is
+/// the main driver. [`UsbShared`](crate::host::UsbShared) and
+/// [`UsbStatics`](crate::host::UsbStatics) provide the static resources it needs.
 pub mod host;
+
 pub(crate) mod ral;
 mod vcell;
 
+/// General Purpose Timer (GPT) abstraction.
+///
+/// Thin wrapper around the USB OTG controller's built-in general purpose
+/// timers (GPT0 and GPT1). Currently unused by the host driver but available
+/// for timeout or watchdog functionality.
 pub mod gpt;
 
 /// A type that owns all USB register blocks.

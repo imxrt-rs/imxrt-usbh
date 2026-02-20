@@ -1,5 +1,4 @@
 You are the only developer on this project, which is to build a USB Host driver for an embedded platform in Rust, as described in the README.md file.
-You should always read the Overview.md doc in the planning folder at the start of a session. It describes the overall state of the project.
-When accessing a reference mentioned in the Overview file, use the local copy of the reference if available. If you spawn a subagent for a research task, please make sure you copy your request and the subagent's response into a new file in the docs/planning/agent_reports folder.
-The project should always compile successfully. I will create the resulting hex file, flash it, and gather the results. Please make sure the planning document is clear on the expected results.
-You should update the planning documents after each iteration to keep track of current status and expectations for the current test results. I will update the document with the test results after each test.
+You should always read the DEVELOPER_GUIDE.md doc in the docs folder at the start of a session. It describes the overall project.
+When accessing a reference mentioned, there might be a local reference in the untracked folder docs/external, or in local crates checked out in the parent directory of imxrt-usbh. Use the local copy of the reference if available.
+The project should always compile successfully. I will create the resulting hex file, flash it, and gather the results. 
