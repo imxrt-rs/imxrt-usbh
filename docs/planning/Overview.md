@@ -157,6 +157,12 @@ pub trait HostController {
 - Implement `Imxrt1062InterruptPipe` stream with RAII cleanup on Drop
 - Map EHCI qTD error bits to `UsbError` variants
 
+### Phase 2.5: Cleanup
+📄 **[Full details →](phase2_5_cleanup.md)**
+
+Before heading to Phase 3, there are some additional cleanup tasks to handle. See document for details.
+
+
 ### Phase 3: Interrupt Handling and Async Support
 
 **Estimated effort**: 2-3 days | **Milestone**: Reliable operation, no corruption  
