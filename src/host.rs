@@ -228,6 +228,45 @@ unsafe impl Sync for UsbShared {}
 /// All DMA-visible arrays (`qh_pool`, `qtd_pool`, `frame_list`) must be in
 /// normal RAM (not TCM) if using cache management, or in DTCM if bypassing
 /// the data cache.
+/// A 32-byte-aligned receive buffer for DMA.
+///
+/// Each buffer is 64 bytes (2 cache lines). The alignment ensures that cache
+/// maintenance operations on a receive buffer cannot corrupt adjacent data in
+/// the same cache line.
+#[repr(C, align(32))]
+pub struct RecvBuf(pub [u8; 64]);
+
+impl RecvBuf {
+    /// Create a zeroed receive buffer.
+    pub const fn new() -> Self {
+        Self([0u8; 64])
+    }
+
+    /// Pointer to the start of the buffer.
+    pub fn as_ptr(&self) -> *const u8 {
+        self.0.as_ptr()
+    }
+
+    /// Length of the buffer.
+    pub const fn len(&self) -> usize {
+        64
+    }
+}
+
+impl core::ops::Index<usize> for RecvBuf {
+    type Output = u8;
+    fn index(&self, idx: usize) -> &u8 {
+        &self.0[idx]
+    }
+}
+
+impl core::ops::Index<core::ops::RangeTo<usize>> for RecvBuf {
+    type Output = [u8];
+    fn index(&self, range: core::ops::RangeTo<usize>) -> &[u8] {
+        &self.0[range]
+    }
+}
+
 pub struct UsbStatics {
     /// Pool for control pipe slots (1 slot — only one EP0 at a time).
     pub control_pipes: Pool,
@@ -250,10 +289,11 @@ pub struct UsbStatics {
 
     /// Receive buffers for interrupt pipes.
     ///
-    /// One 64-byte buffer per interrupt pipe slot. These live in a `static`
-    /// so their addresses are stable for the DMA engine. Index matches the
-    /// `bulk_pipes` pool token (0..NUM_QH-2).
-    pub recv_bufs: [[u8; 64]; NUM_QH - 1],
+    /// One 64-byte buffer per interrupt pipe slot, 32-byte aligned for cache
+    /// line safety. These live in a `static` so their addresses are stable
+    /// for the DMA engine. Index matches the `bulk_pipes` pool token
+    /// (0..NUM_QH-2).
+    pub recv_bufs: [RecvBuf; NUM_QH - 1],
 }
 
 impl UsbStatics {
@@ -274,7 +314,10 @@ impl UsbStatics {
                 [QTD; NUM_QTD]
             },
             frame_list: FrameList::new(),
-            recv_bufs: [[0u8; 64]; NUM_QH - 1],
+            recv_bufs: {
+                const BUF: RecvBuf = RecvBuf::new();
+                [BUF; NUM_QH - 1]
+            },
         }
     }
 }
@@ -513,16 +556,16 @@ impl Imxrt1062HostController {
         // Use modify to preserve other PORTSC1 bits.
         ral::modify_reg!(ral::usb, self.usb, PORTSC1, PP: 1);
 
-        // ---- Step 10: High-speed disconnect detection (deferred) ----
+        // ---- Step 10: High-speed disconnect detection ----
         //
         // ENHOSTDISCONDETECT must NOT be set until a High Speed device is
         // connected. Setting it prematurely can cause false disconnect events
         // and interfere with FS→HS chirp negotiation during port reset.
         // Per USBHost_t36 (ehci.cpp:405): set only after HSP=1 in PORTSC1.
         //
-        // For now, this is handled lazily: set when we first detect HSP=1
-        // during a control transfer, cleared on device disconnect.
-        // See phase2c_debugging.md for rationale.
+        // This is handled in Imxrt1062DeviceDetect::poll_next():
+        //   - Set ENHOSTDISCONDETECT when device_status is Present(High480)
+        //   - Clear ENHOSTDISCONDETECT on disconnect or FS/LS connection
 
         // ---- Step 11: Enable interrupts ----
         //
@@ -1342,30 +1385,13 @@ impl Imxrt1062HostController {
 
         // 13. Compute the byte count from the transfer result.
         if let Err(ref e) = result {
-            // Read the raw qTD token and QH for diagnosis.
-            cache::clean_invalidate_dcache_by_address(
-                data_qtd as usize,
-                core::mem::size_of::<TransferDescriptor>(),
-            );
-            cache::clean_invalidate_dcache_by_address(
-                qh as usize,
-                core::mem::size_of::<QueueHead>(),
-            );
-            let raw_token = unsafe { (*data_qtd).token.read() };
-            let buf0 = unsafe { (*data_qtd).buffer[0].read() };
-            let qh_char = unsafe { (*qh).characteristics.read() };
-            let qh_overlay_tok = unsafe { (*qh).overlay_token.read() };
             debug!(
-                "[HC] bulk {} addr={} ep={} len={} -> Err({}) token=0x{:08X} buf0=0x{:08X} char=0x{:08X} overlay=0x{:08X}",
+                "[HC] bulk {} addr={} ep={} len={} -> Err({})",
                 if is_in { "IN" } else { "OUT" },
                 address,
                 endpoint,
                 data_len,
                 Self::usb_error_str(e),
-                raw_token,
-                buf0,
-                qh_char,
-                qh_overlay_tok,
             );
         }
         let byte_result: Result<usize, UsbError> = match result {
@@ -1658,14 +1684,20 @@ unsafe impl Send for AsyncAdvanceWait<'_> {}
 #[derive(Copy, Clone)]
 pub struct Imxrt1062DeviceDetect {
     usb: *const ral::usb::RegisterBlock,
+    usbphy: *const ral::usbphy::RegisterBlock,
     waker: &'static CriticalSectionWakerRegistration,
     status: DeviceStatus,
 }
 
 impl Imxrt1062DeviceDetect {
-    fn new(usb: &ral::usb::Instance, waker: &'static CriticalSectionWakerRegistration) -> Self {
+    fn new(
+        usb: &ral::usb::Instance,
+        usbphy: &ral::usbphy::Instance,
+        waker: &'static CriticalSectionWakerRegistration,
+    ) -> Self {
         Self {
             usb: usb.addr as *const ral::usb::RegisterBlock,
+            usbphy: usbphy.addr as *const ral::usbphy::RegisterBlock,
             waker,
             status: DeviceStatus::Absent,
         }
@@ -1699,6 +1731,28 @@ impl Imxrt1062DeviceDetect {
         };
         ral::modify_reg!(ral::usb, usb_instance, USBINTR, |v| v | (1 << 2));
     }
+
+    /// Set ENHOSTDISCONDETECT in the USBPHY CTRL register.
+    ///
+    /// Must only be called when a High Speed device is connected (HSP=1).
+    /// Enables the PHY's HS disconnect detector.
+    fn set_enhostdiscondetect(&self) {
+        let usbphy = ral::usbphy::Instance {
+            addr: self.usbphy,
+        };
+        ral::write_reg!(ral::usbphy, usbphy, CTRL_SET, ENHOSTDISCONDETECT: 1);
+    }
+
+    /// Clear ENHOSTDISCONDETECT in the USBPHY CTRL register.
+    ///
+    /// Called on device disconnect to prevent false disconnect detection
+    /// when no device is connected.
+    fn clear_enhostdiscondetect(&self) {
+        let usbphy = ral::usbphy::Instance {
+            addr: self.usbphy,
+        };
+        ral::write_reg!(ral::usbphy, usbphy, CTRL_CLR, ENHOSTDISCONDETECT: 1);
+    }
 }
 
 impl Stream for Imxrt1062DeviceDetect {
@@ -1715,6 +1769,24 @@ impl Stream for Imxrt1062DeviceDetect {
             };
             let portsc = ral::read_reg!(ral::usb, usb_instance, PORTSC1);
             debug!("[HC] DeviceDetect: status change  PORTSC1=0x{:08X}", portsc);
+
+            // Manage ENHOSTDISCONDETECT based on connection state.
+            // Per i.MX RT reference manual and USBHost_t36: set only when a
+            // High Speed device is connected (HSP=1), clear on disconnect.
+            match device_status {
+                DeviceStatus::Present(UsbSpeed::High480) => {
+                    self.set_enhostdiscondetect();
+                    debug!("[HC] ENHOSTDISCONDETECT set (HS device connected)");
+                }
+                DeviceStatus::Absent => {
+                    self.clear_enhostdiscondetect();
+                }
+                _ => {
+                    // FS/LS device — ensure disconnect detector is off.
+                    self.clear_enhostdiscondetect();
+                }
+            }
+
             self.reenable_interrupt();
             self.status = device_status;
             Poll::Ready(Some(device_status))
@@ -1959,7 +2031,7 @@ impl HostController for Imxrt1062HostController {
     type DeviceDetect = Imxrt1062DeviceDetect;
 
     fn device_detect(&self) -> Self::DeviceDetect {
-        Imxrt1062DeviceDetect::new(&self.usb, self.shared.device_waker())
+        Imxrt1062DeviceDetect::new(&self.usb, &self.usbphy, self.shared.device_waker())
     }
 
     fn reset_root_port(&self, rst: bool) {

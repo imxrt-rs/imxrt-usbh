@@ -206,12 +206,15 @@ mod app {
     // -----------------------------------------------------------------------
 
     fn enable_vbus_power() {
+        // Match USBHost_t36 ehci.cpp lines 208-213 exactly:
+        //   IOMUXC_SW_MUX_CTL_PAD_GPIO_EMC_40 = 5;
+        //   IOMUXC_SW_PAD_CTL_PAD_GPIO_EMC_40 = 0x0008;
+        //   GPIO8_GDIR |= 1<<26;
+        //   GPIO8_DR_SET = 1<<26;
+        // Note: USBHost_t36 does NOT set any IOMUXC_GPR register.
         let iomuxc = unsafe { ral::iomuxc::IOMUXC::instance() };
         ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_EMC_40, 5);
         ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_EMC_40, 0x0008);
-
-        let iomuxc_gpr = unsafe { ral::iomuxc_gpr::IOMUXC_GPR::instance() };
-        ral::modify_reg!(ral::iomuxc_gpr, iomuxc_gpr, GPR27, |v| v | (1 << 26));
 
         let gpio8 = unsafe { ral::gpio::GPIO8::instance() };
         ral::modify_reg!(ral::gpio, gpio8, GDIR, |v| v | (1 << 26));
@@ -451,19 +454,14 @@ mod app {
     // Heartbeat — LED blink at high priority to prove system is alive
     // -----------------------------------------------------------------------
 
-    #[task(binds = BOARD_PIT, local = [led, pit, heartbeat_count: u32 = 0], shared = [poller], priority = 3)]
+    #[task(binds = BOARD_PIT, local = [led, pit], shared = [poller], priority = 3)]
     fn pit_interrupt(mut cx: pit_interrupt::Context) {
-        let pit_interrupt::LocalResources { led, pit, heartbeat_count, .. } = cx.local;
+        let pit_interrupt::LocalResources { led, pit, .. } = cx.local;
         if pit.is_elapsed() {
             while pit.is_elapsed() {
                 pit.clear_elapsed();
             }
             led.toggle();
-            *heartbeat_count += 1;
-            // Log every 4th beat (every 2 seconds) to prove logging is alive.
-            if *heartbeat_count % 4 == 0 {
-                log::info!("[heartbeat] tick #{}", *heartbeat_count);
-            }
             // Force-drain the log buffer from a known-good high-priority context.
             cx.shared.poller.lock(|poller| poller.poll());
         }

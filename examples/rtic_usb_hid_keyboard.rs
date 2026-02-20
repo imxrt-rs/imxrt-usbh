@@ -226,8 +226,13 @@ mod app {
         ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_EMC_40, 5);
         ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_EMC_40, 0x0008);
 
+        // Route GPIO_EMC_40 (GPIO3_IO26) to fast GPIO8_IO26.
+        // The Teensy Arduino startup sets GPR26-29 = 0xFFFFFFFF; our bare-metal
+        // runtime doesn't, so GPR28[26] defaults to 0 (pin driven by GPIO3).
+        // Without this, writes to GPIO8 registers update the register file but
+        // don't actually drive the pin.
         let iomuxc_gpr = unsafe { ral::iomuxc_gpr::IOMUXC_GPR::instance() };
-        ral::modify_reg!(ral::iomuxc_gpr, iomuxc_gpr, GPR27, |v| v | (1 << 26));
+        ral::modify_reg!(ral::iomuxc_gpr, iomuxc_gpr, GPR28, |v| v | (1 << 26));
 
         let gpio8 = unsafe { ral::gpio::GPIO8::instance() };
         ral::modify_reg!(ral::gpio, gpio8, GDIR, |v| v | (1 << 26));
@@ -286,6 +291,9 @@ mod app {
         };
         let dma_a = dma[board::BOARD_DMA_A_INDEX].take().unwrap();
         let poller = board::logging::init(FRONTEND, BACKEND, console, dma_a, usbd);
+        // Filter out TRACE-level messages to avoid overflowing the 1024-byte log buffer
+        // during rapid USB transfer sequences.
+        log::set_max_level(log::LevelFilter::Debug);
 
         (Shared { poller }, Local {})
     }

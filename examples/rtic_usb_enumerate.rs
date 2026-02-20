@@ -218,6 +218,9 @@ mod app {
         };
         let dma_a = dma[board::BOARD_DMA_A_INDEX].take().unwrap();
         let poller = board::logging::init(FRONTEND, BACKEND, console, dma_a, usbd);
+        // Filter out TRACE-level messages to avoid overflowing the 1024-byte log buffer
+        // during rapid USB transfer sequences.
+        log::set_max_level(log::LevelFilter::Debug);
 
         (Shared { poller }, Local {})
     }
