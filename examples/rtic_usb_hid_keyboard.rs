@@ -51,7 +51,7 @@
 #[rtic::app(device = board, peripherals = false, dispatchers = [BOARD_SWTASK0])]
 mod app {
     use core::pin::pin;
-    use cotton_usb_host::usb_bus::{DeviceEvent, UsbBus};
+    use cotton_usb_host::usb_bus::{DeviceEvent, HubState, UsbBus};
     use cotton_usb_host::wire::{
         ConfigurationDescriptor, DescriptorVisitor, EndpointDescriptor, InterfaceDescriptor,
     };
@@ -388,6 +388,7 @@ mod app {
     /// Async task: enumerate device, find HID interrupt endpoint, poll for reports.
     ///
     /// Uses the cotton-usb-host high-level API:
+    ///  - `UsbBus::device_events()` with `HubState` for hub-aware enumeration
     ///  - `UsbBus::get_configuration()` to parse descriptors via `HidFinder`
     ///  - `UsbBus::configure()` to issue SET_CONFIGURATION
     ///  - `UsbBus::interrupt_endpoint_in()` to open the interrupt IN stream
@@ -395,8 +396,9 @@ mod app {
     async fn hid_keyboard(_cx: hid_keyboard::Context, host: Imxrt1062HostController) {
         log::info!("Entering device event loop...");
 
+        let hub_state: HubState<Imxrt1062HostController> = HubState::default();
         let bus = UsbBus::new(host);
-        let mut events = pin!(bus.device_events_no_hubs(delay_ms));
+        let mut events = pin!(bus.device_events(&hub_state, delay_ms));
 
         loop {
             match events.next().await {
@@ -496,7 +498,9 @@ mod app {
                         port
                     );
                 }
-                Some(DeviceEvent::HubConnect(_)) => {}
+                Some(DeviceEvent::HubConnect(hub)) => {
+                    log::info!("DeviceEvent::HubConnect  addr={}", hub.address());
+                }
                 Some(DeviceEvent::None) => {}
                 None => {
                     log::warn!("Device event stream ended");

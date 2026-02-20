@@ -8,10 +8,10 @@ follows the pattern established by the RP2040 host controller implementation in
 `cotton-usb-host::host::rp2040`.
 
 
-**Document Version**: 4.5
-**Date**: 2026-02-18
-**Status**: Phase 2c COMPLETE — Bulk transfers working. USB flash drive sector 0 read successfully via SCSI READ(10) over BOT protocol.
-**Next Step**: Clean up debug diagnostics, commit milestone, then Phase 3 (robustness, cache audit, polish).
+**Document Version**: 4.10
+**Date**: 2026-02-19
+**Status**: Phase 4 — Hub disconnect/reconnect fix ready for test (§4.7). Two fixes: TransferComplete overlay check (imxrt-usbh) + HubStateStream stale pipe cleanup (cotton-usb-host).
+**Next Step**: Flash `rtic_usb_hid_keyboard.hex` and test full hub disconnect/reconnect cycle. See phase4_testing.md §4.7.
 
 ## Goals
 

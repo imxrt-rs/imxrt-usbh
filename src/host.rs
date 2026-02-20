@@ -23,10 +23,10 @@
 
 use crate::cache;
 use crate::ehci::{
-    self, link_pointer, link_type, FrameList, QueueHead, TransferDescriptor, LINK_TERMINATE,
-    PID_IN, PID_OUT, PID_SETUP, QTD_TOKEN_ACTIVE, QTD_TOKEN_BABBLE, QTD_TOKEN_BUFFER_ERR,
-    QTD_TOKEN_HALTED, QTD_TOKEN_MISSED_UFRAME, QTD_TOKEN_XACT_ERR, SPEED_FULL, SPEED_HIGH,
-    SPEED_LOW,
+    self, link_address, link_is_terminate, link_pointer, link_type, FrameList, QueueHead,
+    TransferDescriptor, LINK_TERMINATE, PID_IN, PID_OUT, PID_SETUP, QTD_TOKEN_ACTIVE,
+    QTD_TOKEN_BABBLE, QTD_TOKEN_BUFFER_ERR, QTD_TOKEN_HALTED, QTD_TOKEN_MISSED_UFRAME,
+    QTD_TOKEN_XACT_ERR, SPEED_FULL, SPEED_HIGH, SPEED_LOW,
 };
 use crate::ral;
 use core::cell::Cell;
@@ -553,8 +553,20 @@ impl Imxrt1062HostController {
         // ---- Step 9: Enable port power ----
         //
         // PP (Port Power) must be set for the root port to supply power.
-        // Use modify to preserve other PORTSC1 bits.
-        ral::modify_reg!(ral::usb, self.usb, PORTSC1, PP: 1);
+        // PFSC (Port Force Full Speed Connect, bit 24) is set to prevent HS
+        // negotiation. This forces all devices (including hubs) to connect at
+        // Full Speed, which matches the cotton-usb-host framework's model:
+        //   - FS hubs act as simple repeaters (no Transaction Translator)
+        //   - LS devices behind FS hubs use WithPreamble (PRE PID)
+        // Without PFSC, a HS hub requires EHCI split transactions (hub_addr,
+        // hub_port, C-mask in QH), which cotton-usb-host doesn't support.
+        //
+        // PFSC is an NXP extension (not in the EHCI specification).
+        // Performance note: all traffic is limited to 12 Mbps with PFSC=1.
+        let portsc = self.portsc1_read_safe();
+        ral::write_reg!(ral::usb, self.usb, PORTSC1,
+            portsc | (1 << 12) | (1 << 24)  // PP=1, PFSC=1
+        );
 
         // ---- Step 10: High-speed disconnect detection ----
         //
@@ -984,12 +996,18 @@ impl Imxrt1062HostController {
         let qh_index = 1;
         let qh = unsafe { self.qh_mut(qh_index) };
 
-        // Determine port speed
-        let speed = match self.port_speed() {
-            0 => SPEED_FULL,
-            1 => SPEED_LOW,
-            2 => SPEED_HIGH,
-            _ => SPEED_FULL,
+        // Determine device speed.
+        // WithPreamble indicates a Low Speed device behind a Full Speed hub.
+        // In that case, override port_speed() (which reports the root port
+        // speed, not the target device speed) to SPEED_LOW.
+        let speed = match transfer_extras {
+            TransferExtras::WithPreamble => SPEED_LOW,
+            TransferExtras::Normal => match self.port_speed() {
+                0 => SPEED_FULL,
+                1 => SPEED_LOW,
+                2 => SPEED_HIGH,
+                _ => SPEED_FULL,
+            },
         };
 
         // Build QH characteristics
@@ -1002,26 +1020,27 @@ impl Imxrt1062HostController {
             false,          // not head of reclamation
         );
 
-        // Build QH capabilities — handle TransferExtras::WithPreamble for
-        // split transactions (FS/LS device behind HS hub)
-        let capabilities = match transfer_extras {
-            TransferExtras::Normal => ehci::qh_capabilities(0, 0, 0, 0, 1),
-            TransferExtras::WithPreamble => {
-                // For split transactions, we need the hub address and port.
-                // WithPreamble is used for LS devices behind FS hubs.
-                // In EHCI, split transactions require hub_addr and hub_port
-                // in the QH capabilities, plus S-mask/C-mask.
-                // For now, set default values — proper hub support requires
-                // additional context from the caller.
-                ehci::qh_capabilities(0, 0, 0, 0, 1)
-            }
-        };
+        // Build QH capabilities.
+        // For WithPreamble (LS behind FS hub), the NXP EHCI embedded TT
+        // handles the FS↔LS conversion at the root port. No explicit
+        // hub_addr/hub_port is needed when the hub is at Full Speed on
+        // the root port (PFSC=1 mode).
+        let capabilities = ehci::qh_capabilities(0, 0, 0, 0, 1);
 
-        // Log QH configuration for debugging
-        trace!("[HC] control xfer: addr={} pkt={} PORTSC1=0x{:08X} speed={} char=0x{:08X} caps=0x{:08X}",
-            address, packet_size,
-            ral::read_reg!(ral::usb, self.usb, PORTSC1),
-            speed, characteristics, capabilities);
+        // Log QH configuration for debugging.
+        // Use debug! for hub-connected devices (addr > 1) to help diagnose hub issues.
+        let speed_str = match speed {
+            SPEED_FULL => "FS",
+            SPEED_LOW => "LS",
+            SPEED_HIGH => "HS",
+            _ => "??",
+        };
+        let extras_str = match transfer_extras {
+            TransferExtras::WithPreamble => "WithPreamble(LS)",
+            TransferExtras::Normal => "Normal",
+        };
+        debug!("[HC] control xfer: addr={} pkt={} speed={} extras={} char=0x{:08X} caps=0x{:08X}",
+            address, packet_size, speed_str, extras_str, characteristics, capabilities);
 
         // Initialise the QH
         unsafe { (*qh).init_endpoint(characteristics, capabilities) };
@@ -1451,7 +1470,7 @@ impl Imxrt1062HostController {
         &self,
         pipe: Pipe,
         address: u8,
-        _transfer_extras: TransferExtras,
+        transfer_extras: TransferExtras,
         endpoint: u8,
         max_packet_size: u16,
         _interval_ms: u8,
@@ -1468,15 +1487,21 @@ impl Imxrt1062HostController {
         // We use a dedicated qTD for the lifetime of the pipe (one in-flight at a time).
         let qtd_index = self.alloc_qtd().expect("qTD pool exhausted for interrupt pipe");
 
-        // Determine port speed.
-        let speed = match self.port_speed() {
-            0 => ehci::SPEED_FULL,
-            1 => ehci::SPEED_LOW,
-            _ => ehci::SPEED_HIGH,
+        // Determine device speed.
+        // WithPreamble indicates a Low Speed device behind a Full Speed hub.
+        let speed = match transfer_extras {
+            TransferExtras::WithPreamble => ehci::SPEED_LOW,
+            TransferExtras::Normal => match self.port_speed() {
+                0 => ehci::SPEED_FULL,
+                1 => ehci::SPEED_LOW,
+                _ => ehci::SPEED_HIGH,
+            },
         };
 
         // Build QH endpoint characteristics.
         // DTC = 0 (hardware-managed data toggle in QH overlay) for non-control endpoints.
+        // RL (NAK Reload) MUST be 0 for periodic schedule QHs (EHCI §3.6).
+        // qh_characteristics() sets RL=15 for async schedule use; clear it here.
         let characteristics = ehci::qh_characteristics(
             address,
             endpoint,
@@ -1484,7 +1509,7 @@ impl Imxrt1062HostController {
             max_packet_size,
             false, // not a control endpoint
             false, // not head of reclamation list
-        );
+        ) & !(0xF << 28); // Clear RL bits [31:28] — must be 0 for periodic QHs
 
         // Build QH endpoint capabilities.
         // S-mask = 0x01: poll in micro-frame 0 of each scheduled frame.
@@ -1531,10 +1556,76 @@ impl Imxrt1062HostController {
             core::mem::size_of::<ehci::FrameList>(),
         );
 
+        // Diagnostic: log speed, QH config, and periodic schedule chain.
+        let extras_str = match transfer_extras {
+            TransferExtras::WithPreamble => "WithPreamble(LS)",
+            TransferExtras::Normal => "Normal",
+        };
+        let speed_str = match speed {
+            ehci::SPEED_FULL => "FS",
+            ehci::SPEED_LOW => "LS",
+            ehci::SPEED_HIGH => "HS",
+            _ => "??",
+        };
         debug!(
-            "[HC] interrupt pipe allocated: addr={} ep={} mps={} qh={} qtd={}",
-            address, endpoint, max_packet_size, qh_index, qtd_index
+            "[HC] interrupt pipe allocated: addr={} ep={} mps={} qh={} qtd={} extras={} speed={}",
+            address, endpoint, max_packet_size, qh_index, qtd_index, extras_str, speed_str
         );
+        debug!(
+            "[HC]   QH char=0x{:08X} caps=0x{:08X}",
+            characteristics, capabilities
+        );
+
+        // Log the periodic schedule chain (frame_list[0] → QH → QH → ...).
+        {
+            let head = self.statics.frame_list.entries[0].read();
+            if link_is_terminate(head) {
+                debug!("[HC]   periodic chain: [empty]");
+            } else {
+                let mut chain_buf = [0u8; 64];
+                let mut pos = 0;
+                let mut link = head;
+                for _ in 0..NUM_QH + 1 {
+                    if link_is_terminate(link) {
+                        break;
+                    }
+                    let addr = link_address(link);
+                    // Find which QH index this address corresponds to
+                    let mut found_idx: i8 = -1;
+                    for qi in 0..=NUM_QH {
+                        let qa = &self.statics.qh_pool[qi] as *const QueueHead as u32;
+                        if qa == addr {
+                            found_idx = qi as i8;
+                            break;
+                        }
+                    }
+                    if pos + 8 < chain_buf.len() {
+                        if pos > 0 {
+                            chain_buf[pos] = b'-';
+                            chain_buf[pos + 1] = b'>';
+                            pos += 2;
+                        }
+                        chain_buf[pos] = b'Q';
+                        chain_buf[pos + 1] = b'H';
+                        if found_idx >= 0 {
+                            chain_buf[pos + 2] = b'0' + (found_idx as u8);
+                        } else {
+                            chain_buf[pos + 2] = b'?';
+                        }
+                        pos += 3;
+                    }
+                    // Follow horizontal_link
+                    let qh_ptr = addr as *const QueueHead;
+                    cache::clean_invalidate_dcache_by_address(
+                        qh_ptr as usize,
+                        core::mem::size_of::<QueueHead>(),
+                    );
+                    link = unsafe { (*qh_ptr).horizontal_link.read() };
+                }
+                let chain_str = core::str::from_utf8(&chain_buf[..pos]).unwrap_or("??");
+                debug!("[HC]   periodic chain: {}", chain_str);
+            }
+        }
 
         Imxrt1062InterruptPipe {
             pipe,
@@ -1587,7 +1678,25 @@ impl Future for TransferComplete<'_> {
         let token = status_qtd.token.read();
 
         if token & QTD_TOKEN_ACTIVE != 0 {
-            // Still active — check if data qTD has errored (early exit)
+            // Still active — check if the QH overlay is halted.
+            //
+            // When the EHCI controller halts a qTD (e.g. setup phase got no
+            // response from a disconnected device, CERR exhausted), it copies
+            // the halted qTD's token into the QH overlay and stops advancing
+            // the chain. The status_qtd (last in the chain) remains Active
+            // because the controller never reached it.
+            //
+            // Without this check, TransferComplete hangs forever when the
+            // setup qTD halts — this happens when cotton-usb-host tries a
+            // control transfer to a hub that was just physically disconnected.
+            let qh = unsafe { &*self.qh };
+            let overlay = qh.overlay_token.read();
+            if overlay & QTD_TOKEN_HALTED != 0 {
+                debug!("[HC] TransferComplete: QH overlay halted (overlay=0x{:08x}), aborting", overlay);
+                return Poll::Ready(Err(Imxrt1062HostController::map_qtd_error(overlay)));
+            }
+
+            // Also check if data qTD has errored (early exit)
             if let Some(data_qtd_ptr) = self.data_qtd {
                 let data_qtd = unsafe { &*data_qtd_ptr };
                 let data_token = data_qtd.token.read();
@@ -1763,7 +1872,18 @@ impl Stream for Imxrt1062DeviceDetect {
 
         let device_status = self.read_device_status();
 
-        if device_status != self.status {
+        // Determine whether this is a connect/disconnect transition.
+        // We intentionally suppress speed-change-only events because EHCI
+        // reports FS before port reset (PSPD from line state) then HS after
+        // reset (PSPD from chirp negotiation). Without this filter, a HS
+        // device triggers two DeviceDetect events: Present(Full12) then
+        // Present(High480), and the second one causes cotton-usb-host to
+        // re-reset the port and re-enumerate, disrupting hub state.
+        let was_connected = matches!(self.status, DeviceStatus::Present(_));
+        let is_connected = matches!(device_status, DeviceStatus::Present(_));
+        let connection_changed = was_connected != is_connected;
+
+        if connection_changed {
             let usb_instance = ral::usb::Instance {
                 addr: self.usb as *mut _,
             };
@@ -1791,6 +1911,14 @@ impl Stream for Imxrt1062DeviceDetect {
             self.status = device_status;
             Poll::Ready(Some(device_status))
         } else {
+            // Silently track any speed change (e.g. FS→HS after reset) and
+            // manage ENHOSTDISCONDETECT without firing a new event.
+            if device_status != self.status {
+                if matches!(device_status, DeviceStatus::Present(UsbSpeed::High480)) {
+                    self.set_enhostdiscondetect();
+                }
+                self.status = device_status;
+            }
             self.reenable_interrupt();
             Poll::Pending
         }
@@ -1896,7 +2024,26 @@ impl Stream for Imxrt1062InterruptPipe {
             return Poll::Pending;
         }
 
-        // --- Transfer complete (Active cleared by controller) ---
+        // If the qTD halted, the device is likely disconnected or the endpoint
+        // stalled. Terminate the stream (return None) so the application's
+        // inner poll loop breaks out and the outer event loop can poll
+        // DeviceDetect to handle the disconnect. Do NOT re-arm the qTD —
+        // re-arming a halted pipe when the device is absent creates an
+        // infinite busy-loop of halt → re-arm → halt.
+        if token & ehci::QTD_TOKEN_HALTED != 0 {
+            debug!(
+                "[HC] InterruptPipe: qTD halted (token=0x{:08x}), terminating stream",
+                token,
+            );
+            // Re-enable port change interrupt so DeviceDetect can fire.
+            let usb_inst = ral::usb::Instance {
+                addr: self.usb as *mut _,
+            };
+            ral::modify_reg!(ral::usb, usb_inst, USBINTR, |v| v | (1 << 2));
+            return Poll::Ready(None);
+        }
+
+        // --- Transfer complete (Active cleared, no halt) ---
 
         // Invalidate receive buffer cache before reading the data.
         // Use invalidate-only (DCIMVAC), NOT clean+invalidate (DCCIMVAC),
@@ -1905,10 +2052,6 @@ impl Stream for Imxrt1062InterruptPipe {
         let recv_buf = &self.statics.recv_bufs[self.recv_buf_idx];
         cache::invalidate_dcache_by_address(recv_buf.as_ptr() as usize, recv_buf.len());
 
-        // DIAG Step 2: Log raw qTD token and first 8 recv_buf bytes.
-        // H1 (DTCM): bytes always 00 even with key held.
-        // H3 (Error): token bit6=Halted or bit3=XACT_ERR, remaining=mps (0 bytes transferred).
-        // Working: token=0x0000_0000, remaining=0, non-zero bytes on key press.
         debug!(
             "[HC] qTD done: token=0x{:08x} rem={} buf=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
             token,
