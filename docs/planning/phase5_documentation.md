@@ -14,3 +14,5 @@
 - [ ] Update README.md with working usage example and hardware setup
 - [ ] Add `# Panics` documentation for any functions that can panic
 - [ ] Consider adding `defmt` feature flag for debug logging (already in Cargo.toml dependencies)
+- [ ] Add another example that shows how to process multiple devices (say a mouse and keyboard) through a hub.
+- [ ] Document limitation around hubs and HS devices

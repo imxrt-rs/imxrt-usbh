@@ -2,8 +2,11 @@
 
 **Estimated effort**: 2-3 days  
 **Key milestone**: Reliable operation, no corruption
+**Status**: ✅ COMPLETE — all items implemented during phases 1–2c
 
-## 3.1 Interrupt Handler (`UsbShared::on_irq()`)
+## 3.1 Interrupt Handler (`UsbShared::on_irq()`) — ✅ COMPLETE
+
+Implemented during phases 1–2 as part of getting transfers working.
 
 Following the RP2040's disable-on-handle pattern to prevent IRQ storms:
 
@@ -45,89 +48,78 @@ EHCI `USBSTS[USBINT]` fires on *any* qTD completion with IOC set, but doesn't id
 
 ### Checklist
 
-- [ ] Implement `on_irq()` as shown above
-- [ ] Add `async_advance_waker: CriticalSectionWakerRegistration` to `UsbShared`
-- [ ] Bind to NVIC IRQ: `USB_OTG2` (IRQ #112)
-- [ ] RTIC task binding example:
-  ```rust
-  #[task(binds = USB_OTG2, shared = [&usb_shared], priority = 2)]
-  fn usb_host_irq(cx: usb_host_irq::Context) {
-      cx.shared.usb_shared.on_irq();
-  }
-  ```
+- [x] Implement `on_irq()` — `UsbShared::on_irq()` in `src/host.rs`
+- [x] Add `async_advance_waker: CriticalSectionWakerRegistration` to `UsbShared`
+- [x] Bind to NVIC IRQ: `USB_OTG2` (IRQ #112) — all examples manually install ISR at priority 0xE0
+- [x] Re-enable-on-poll helpers: `reenable_interrupt()`, `reenable_transfer_interrupts()`, `reenable_async_advance_interrupt()`
+- [x] Public API: `on_usb_irq(usb_base: *const ())` avoids exposing RAL types to app code
 
-## 3.2 Waker Registration Pattern
+Note: Examples use manual ISR installation (vector table patching) rather than
+RTIC `#[task(binds = USB_OTG2)]` because RTIC's dispatcher uses a different
+interrupt than USB_OTG2. The manual approach is functionally equivalent.
 
-Following the RP2040's pattern with `CriticalSectionWakerRegistration` (from `rtic-common`):
+## 3.2 Waker Registration Pattern — ✅ COMPLETE
 
-- [ ] In each `Future::poll()` / `Stream::poll_next()`:
+Implemented during phases 2a–2c. All futures and streams follow the
+register-waker → re-enable-interrupt → check-status pattern.
+
+- [x] In each `Future::poll()` / `Stream::poll_next()`:
   1. Register waker: `shared.pipe_wakers[my_index].register(cx.waker())`
   2. Re-enable relevant interrupt bits in `USBINTR` (counterpart to disable-on-handle in ISR)
   3. Check for completion (cache-invalidate first, then read QH/qTD status)
   4. If not done → `Poll::Pending`
   5. If done → clean up and `Poll::Ready(result)`
-- [ ] Ensure waker registration happens *before* re-enabling interrupts to avoid race conditions
-- [ ] Device detection waker: `shared.device_waker`
-- [ ] Per-pipe wakers: `shared.pipe_wakers[pipe_index]`
-- [ ] Async advance waker: `shared.async_advance_waker`
+- [x] Ensure waker registration happens *before* re-enabling interrupts to avoid race conditions
+  - `TransferComplete::poll()`: registers waker at line 1577, re-enables interrupts at line 1603
+  - `Imxrt1062DeviceDetect::poll_next()`: registers waker at line 1762, re-enables at `reenable_interrupt()`
+  - `Imxrt1062InterruptPipe::poll_next()`: registers waker at line 1877, re-enables at line 1892
+  - `AsyncAdvanceWait::poll()`: registers waker at line 1653, re-enables at `reenable_async_advance_interrupt()`
+- [x] Device detection waker: `shared.device_waker`
+- [x] Per-pipe wakers: `shared.pipe_wakers[pipe_index]`
+- [x] Async advance waker: `shared.async_advance_waker`
 
-## 3.3 DMA and Cache Coherency
+## 3.3 DMA and Cache Coherency — ✅ COMPLETE
 
-See [CACHE_COHERENCY.md](../CACHE_COHERENCY.md) for full details. Summary of required operations:
+Implemented during phases 1–2c. Uses Option A (per-operation cache management).
 
-- [ ] Implement cache management wrapper functions:
+- [x] Implement cache management wrapper functions in `src/cache.rs`:
+  - `invalidate_dcache_by_address()` — invalidate-only (DCIMVAC), for DMA receive buffers
+  - `clean_invalidate_dcache_by_address()` — clean+invalidate (DCCIMVAC), for QH/qTD/OUT buffers
+  - Both include DSB barriers before and after, plus ISB
+- [x] Higher-level wrappers in `Imxrt1062HostController`:
+  - `cache_clean_qh()` — clean+invalidate a QueueHead (64B, 64B-aligned)
+  - `cache_clean_qtd()` — clean+invalidate a TransferDescriptor (32B, 32B-aligned)
+  - `cache_clean_buffer()` — clean+invalidate an arbitrary data buffer
+- [x] `cortex_m::asm::dsb()` barriers embedded inside cache functions
+- [x] Cache operation call sites:
+  - **Before linking QH/qTD to schedule**: `cache_clean_qh()` + `cache_clean_qtd()` + `cache_clean_buffer()` in `do_control_transfer()` and `do_bulk_transfer()`
+  - **Before reading QH/qTD status in poll()**: `cache_clean_qtd()` + `cache_clean_qh()` in `TransferComplete::poll()` and `Imxrt1062InterruptPipe::poll_next()`
+  - **Before reading IN data**: `invalidate_dcache_by_address()` on receive buffer in `Imxrt1062InterruptPipe::poll_next()` and bulk IN completion
+  - **After re-arming interrupt qTD**: `cache_clean_invalidate_dcache_by_address()` in interrupt pipe re-arm
+- [x] Cache-line aliasing prevention:
+  - `QueueHead` is `#[repr(C, align(64))]` — occupies exactly one 64B-aligned region (2 cache lines)
+  - `TransferDescriptor` is `#[repr(C, align(32))]` — occupies exactly one cache line
+  - `RecvBuf` is `#[repr(C, align(32))]` with 64B size — no aliasing with adjacent data
+  - `FrameList` is `#[repr(C, align(4096))]`
+- [x] **Alternative approach (DTCM)**: Not pursued. Per-operation cache management is working correctly.
 
-  ```rust
-  /// Clean (flush) a memory range from D-cache to main memory.
-  /// Call BEFORE the USB controller needs to READ this memory.
-  /// (CPU wrote data → hardware needs to see it)
-  fn cache_clean(addr: *const u8, size: usize);
-  
-  /// Invalidate D-cache for a memory range.
-  /// Call BEFORE the CPU needs to READ data that hardware WROTE.
-  /// (Hardware wrote data → CPU needs to see it)
-  fn cache_invalidate(addr: *const u8, size: usize);
-  
-  /// Clean and invalidate — used when both CPU and hardware may have modified memory.
-  fn cache_clean_invalidate(addr: *const u8, size: usize);
-  ```
+## Challenges for This Phase — All Resolved
 
-- [ ] Use `cortex_m::asm::dsb()` and `cortex_m::asm::dmb()` barriers around DMA operations
-- [ ] Cache operation call sites:
-  - **Before linking QH/qTD to schedule**: `cache_clean()` on QH, all qTDs, and any OUT data buffers
-  - **Before reading QH/qTD status in poll()**: `cache_invalidate()` on the QH overlay and qTDs
-  - **Before reading IN data**: `cache_invalidate()` on the receive data buffer
-  - **After re-arming interrupt qTD**: `cache_clean()` on the qTD
-- [ ] Avoid cache-line aliasing: ensure no non-DMA data shares a cache line (32 bytes) with DMA structures
-- [ ] **Alternative approach**: Consider placing QH/qTD pools in DTCM (addresses 0x2000_0000 – 0x2007_FFFF) which is not cached. This eliminates cache coherency concerns for descriptors entirely, at the cost of using limited DTCM space. Data buffers would still need cache management.
-
-## Challenges for This Phase
-
-### Challenge: Cache Coherency (Cortex-M7 specific)
+### Challenge: Cache Coherency (Cortex-M7 specific) — ✅ Resolved
 
 **Problem**: The Cortex-M7's 32KB L1 write-back D-cache means DMA structures in SRAM are not automatically visible to the USB controller (and vice versa). This causes silent data corruption.
 
-**Solution** (choose one, or combine):
-- **Option A: Per-operation cache management** (recommended for initial implementation)
-  - `cache_clean()` before hardware reads (CPU → DMA)
-  - `cache_invalidate()` before CPU reads (DMA → CPU)
-  - Safer but more code, small performance cost
-- **Option B: Place DMA structures in DTCM** (0x2000_0000 region, not cached)
-  - Eliminates cache concerns for QH/qTD pools
-  - Requires linker script changes to place structures in DTCM
-  - Data buffers (caller-provided) still need cache management
-  - Limited DTCM space (512KB shared with stack)
-- **Option C: Configure MPU to mark DMA regions as non-cacheable**
-  - Clean separation, no per-operation overhead
-  - More complex setup, inflexible region sizes
-- Add cache-line alignment padding to prevent false sharing between DMA and non-DMA data
+**Solution implemented**: Option A — per-operation cache management.
+- `clean_invalidate_dcache_by_address()` before hardware reads (CPU → DMA)
+- `invalidate_dcache_by_address()` before CPU reads (DMA → CPU)
+- All DMA structures (QH, qTD, RecvBuf) are cache-line-aligned to prevent aliasing
+- Working correctly with both HID keyboard and mass storage transfers
 
-### Challenge: EHCI Transfer Completion Identification
+### Challenge: EHCI Transfer Completion Identification — ✅ Resolved
 
 **Problem**: When `USBSTS[USBINT]` fires, EHCI doesn't tell you *which* QH/qTD completed. You must scan all active QHs.
 
-**Solution**:
+**Solution implemented**:
 - Wake all pipe wakers on any completion interrupt (simple, correct, slightly wasteful)
 - Each pipe's `poll()` checks its own QH/qTD status
 - This matches the RP2040 pattern where completion interrupts wake potentially-affected wakers
-- Future optimization: maintain a "dirty" bitmap of active pipes, scan only those
