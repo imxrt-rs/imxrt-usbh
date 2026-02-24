@@ -4,7 +4,7 @@ use crate::ral;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use cotton_usb_host::host_controller::{DeviceStatus, UsbSpeed};
-use futures::Stream;
+use futures_core::Stream;
 use rtic_common::waker_registration::CriticalSectionWakerRegistration;
 
 // ---------------------------------------------------------------------------
@@ -37,8 +37,8 @@ impl Imxrt1062DeviceDetect {
         waker: &'static CriticalSectionWakerRegistration,
     ) -> Self {
         Self {
-            usb_base: usb.addr as u32,
-            usbphy_base: usbphy.addr as u32,
+            usb_base: usb.addr as usize as u32,
+            usbphy_base: usbphy.addr as usize as u32,
             waker,
             status: DeviceStatus::Absent,
         }
@@ -47,14 +47,14 @@ impl Imxrt1062DeviceDetect {
     /// Reconstruct a temporary `ral::usb::Instance` from the stored base address.
     fn usb_instance(&self) -> ral::usb::Instance {
         ral::usb::Instance {
-            addr: self.usb_base as *const _,
+            addr: self.usb_base as *const ral::usb::RegisterBlock,
         }
     }
 
     /// Reconstruct a temporary `ral::usbphy::Instance` from the stored base address.
     fn usbphy_instance(&self) -> ral::usbphy::Instance {
         ral::usbphy::Instance {
-            addr: self.usbphy_base as *const _,
+            addr: self.usbphy_base as *const ral::usbphy::RegisterBlock,
         }
     }
 

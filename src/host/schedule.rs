@@ -5,10 +5,7 @@
 //! and periodic schedules, and safe wrappers that combine link+cache
 //! operations.
 
-use crate::ehci::{
-    self, link_pointer, link_type, QueueHead, TransferDescriptor,
-    LINK_TERMINATE,
-};
+use crate::ehci::{self, link_pointer, link_type, QueueHead, TransferDescriptor, LINK_TERMINATE};
 use crate::ral;
 
 use super::controller::Imxrt1062HostController;
@@ -126,7 +123,9 @@ impl Imxrt1062HostController {
             let sentinel = self.qh_mut(0);
 
             // new_qh → sentinel's old successor
-            (*qh).horizontal_link.write((*sentinel).horizontal_link.read());
+            (*qh)
+                .horizontal_link
+                .write((*sentinel).horizontal_link.read());
 
             // sentinel → new_qh
             let qh_addr = qh as u32;
@@ -159,9 +158,7 @@ impl Imxrt1062HostController {
                 let next_addr = ehci::link_address(next_link);
                 if next_addr == (qh_addr & !0x1F) {
                     // Found it — point prev around qh
-                    (*prev)
-                        .horizontal_link
-                        .write((*qh).horizontal_link.read());
+                    (*prev).horizontal_link.write((*qh).horizontal_link.read());
                     break;
                 }
                 prev = next_addr as *mut QueueHead;

@@ -199,6 +199,12 @@ pub const fn qtd_token_bytes_remaining(token: u32) -> u32 {
     (token >> QTD_TOKEN_TOTAL_BYTES_SHIFT) & 0x7FFF
 }
 
+impl Default for TransferDescriptor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TransferDescriptor {
     /// Create a zeroed-out transfer descriptor (all fields 0, terminated).
     pub const fn new() -> Self {
@@ -284,7 +290,6 @@ impl TransferDescriptor {
 #[repr(C, align(64))]
 pub struct QueueHead {
     // -- Hardware-visible fields (48 bytes = words 0-11) --
-
     /// Horizontal link pointer — next QH in the schedule.
     /// Use [`link_pointer`] with [`link_type::QH`] to build.
     /// Set [`LINK_TERMINATE`] for the last entry.
@@ -304,7 +309,6 @@ pub struct QueueHead {
     // Transfer overlay area (words 4–11) — same layout as a qTD.
     // Inlined as individual fields to avoid alignment padding that would
     // occur if we embedded a `TransferDescriptor` (which has `align(32)`).
-
     /// Overlay: next qTD pointer (word 4).
     pub overlay_next: VCell<u32>,
     /// Overlay: alternate next qTD pointer (word 5).
@@ -317,7 +321,6 @@ pub struct QueueHead {
     // -- Software-private fields (16 bytes = words 12-15) --
     // These occupy the padding between the 48-byte hardware area and the
     // 64-byte alignment. The controller never reads or writes past word 11.
-
     /// Software: which qTD is currently attached (for completion tracking).
     /// Stored as a raw pointer so we can find the qTD in the ISR.
     pub attached_qtd: VCell<u32>,
@@ -386,7 +389,11 @@ pub const fn qh_characteristics(
     is_head: bool,
 ) -> u32 {
     let dtc = if is_control { 1u32 } else { 0u32 };
-    let ctrl_ep = if is_control && speed != SPEED_HIGH { 1u32 } else { 0u32 };
+    let ctrl_ep = if is_control && speed != SPEED_HIGH {
+        1u32
+    } else {
+        0u32
+    };
     let head = if is_head { 1u32 } else { 0u32 };
 
     (address as u32) << QH_CHAR_ADDR_SHIFT
@@ -423,18 +430,18 @@ const QH_CAP_MULT_SHIFT: u32 = 30;
 /// - `hub_port` — hub port for split transactions (0 if not behind a hub)
 /// - `mult` — high-bandwidth multiplier (1 for most transfers)
 #[inline]
-pub const fn qh_capabilities(
-    smask: u8,
-    cmask: u8,
-    hub_addr: u8,
-    hub_port: u8,
-    mult: u8,
-) -> u32 {
+pub const fn qh_capabilities(smask: u8, cmask: u8, hub_addr: u8, hub_port: u8, mult: u8) -> u32 {
     (smask as u32) << QH_CAP_SMASK_SHIFT
         | (cmask as u32) << QH_CAP_CMASK_SHIFT
         | (hub_addr as u32) << QH_CAP_HUB_ADDR_SHIFT
         | (hub_port as u32) << QH_CAP_HUB_PORT_SHIFT
         | (mult as u32) << QH_CAP_MULT_SHIFT
+}
+
+impl Default for QueueHead {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl QueueHead {
@@ -478,12 +485,10 @@ impl QueueHead {
             .write(link_pointer(self_addr, link_type::QH));
         // Mark as head of reclamation list, no real endpoint
         self.characteristics.write(qh_characteristics(
-            0,    // address 0 (unused)
-            0,    // endpoint 0 (unused)
-            SPEED_HIGH,
-            0,    // max packet 0 (unused)
-            false,
-            true, // head of reclamation list
+            0, // address 0 (unused)
+            0, // endpoint 0 (unused)
+            SPEED_HIGH, 0, // max packet 0 (unused)
+            false, true, // head of reclamation list
         ));
         self.capabilities.write(qh_capabilities(0, 0, 0, 0, 1));
         self.current_qtd.write(0);
@@ -609,8 +614,15 @@ pub struct FrameList {
     pub entries: [VCell<u32>; FRAME_LIST_LEN],
 }
 
+impl Default for FrameList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FrameList {
     /// Create a frame list with all entries terminated (no scheduled transfers).
+    #[allow(clippy::declare_interior_mutable_const)]
     pub const fn new() -> Self {
         const TERM: VCell<u32> = VCell::new(LINK_TERMINATE);
         Self {
@@ -633,3 +645,417 @@ const _: () = {
     assert!(core::mem::size_of::<FrameList>() == 4096);
     assert!(core::mem::align_of::<FrameList>() == 4096);
 };
+
+// ---------------------------------------------------------------------------
+// Unit tests (host-only)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::mem;
+
+    // -----------------------------------------------------------------------
+    // Link pointer helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn link_pointer_constructs_qh_link() {
+        let addr: u32 = 0x2000_0040; // 64-byte aligned
+        let lp = link_pointer(addr, link_type::QH);
+        assert_eq!(link_address(lp), addr);
+        assert!(!link_is_terminate(lp));
+        // type bits [2:1] = 0b01 for QH
+        assert_eq!(lp & 0b110, link_type::QH);
+    }
+
+    #[test]
+    fn link_pointer_masks_low_bits() {
+        // Address with low bits set — they should be masked off.
+        let lp = link_pointer(0x2000_001F, link_type::ITD);
+        assert_eq!(link_address(lp), 0x2000_0000);
+        assert_eq!(lp & 0b110, link_type::ITD);
+    }
+
+    #[test]
+    fn link_terminate_detected() {
+        assert!(link_is_terminate(LINK_TERMINATE));
+        assert!(link_is_terminate(0xFFFF_FFFF));
+        assert!(!link_is_terminate(0x2000_0000 | link_type::QH));
+    }
+
+    #[test]
+    fn link_pointer_all_types() {
+        let addr: u32 = 0x2000_0020;
+        assert_eq!(link_pointer(addr, link_type::ITD) & 0b110, link_type::ITD);
+        assert_eq!(link_pointer(addr, link_type::QH) & 0b110, link_type::QH);
+        assert_eq!(link_pointer(addr, link_type::SITD) & 0b110, link_type::SITD);
+        assert_eq!(link_pointer(addr, link_type::FSTN) & 0b110, link_type::FSTN);
+    }
+
+    // -----------------------------------------------------------------------
+    // qTD token builder
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn qtd_token_out_64_bytes_data0_no_ioc() {
+        let tok = qtd_token(PID_OUT, 64, false, false);
+        // Active bit set
+        assert_ne!(tok & QTD_TOKEN_ACTIVE, 0);
+        // PID = OUT (0) at bits [9:8]
+        assert_eq!((tok >> 8) & 0x3, PID_OUT);
+        // CERR = 3 at bits [11:10]
+        assert_eq!((tok >> 10) & 0x3, 3);
+        // total_bytes = 64 at bits [30:16]
+        assert_eq!(qtd_token_bytes_remaining(tok), 64);
+        // DT = 0 at bit 31
+        assert_eq!(tok >> 31, 0);
+        // IOC not set
+        assert_eq!(tok & QTD_TOKEN_IOC, 0);
+    }
+
+    #[test]
+    fn qtd_token_in_512_bytes_data1_ioc() {
+        let tok = qtd_token(PID_IN, 512, true, true);
+        assert_ne!(tok & QTD_TOKEN_ACTIVE, 0);
+        assert_eq!((tok >> 8) & 0x3, PID_IN);
+        assert_eq!(qtd_token_bytes_remaining(tok), 512);
+        assert_eq!(tok >> 31, 1); // DT = 1
+        assert_ne!(tok & QTD_TOKEN_IOC, 0);
+    }
+
+    #[test]
+    fn qtd_token_setup_8_bytes() {
+        let tok = qtd_token(PID_SETUP, 8, false, false);
+        assert_eq!((tok >> 8) & 0x3, PID_SETUP);
+        assert_eq!(qtd_token_bytes_remaining(tok), 8);
+    }
+
+    #[test]
+    fn qtd_token_zero_length() {
+        let tok = qtd_token(PID_IN, 0, false, true);
+        assert_eq!(qtd_token_bytes_remaining(tok), 0);
+        assert_ne!(tok & QTD_TOKEN_IOC, 0);
+    }
+
+    #[test]
+    fn qtd_token_max_transfer() {
+        let tok = qtd_token(PID_IN, QTD_MAX_TRANSFER_SIZE, false, false);
+        assert_eq!(qtd_token_bytes_remaining(tok), QTD_MAX_TRANSFER_SIZE);
+    }
+
+    #[test]
+    fn qtd_token_bytes_remaining_extracts_correctly() {
+        // Manually construct a token with known total_bytes
+        let bytes: u32 = 1234;
+        let tok = bytes << 16 | QTD_TOKEN_ACTIVE;
+        assert_eq!(qtd_token_bytes_remaining(tok), 1234);
+    }
+
+    // -----------------------------------------------------------------------
+    // QH Characteristics builder
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn qh_char_control_endpoint_full_speed() {
+        let ch = qh_characteristics(1, 0, SPEED_FULL, 64, true, false);
+        // Device address = 1 at bits [6:0]
+        assert_eq!(ch & 0x7F, 1);
+        // Endpoint = 0 at bits [11:8]
+        assert_eq!((ch >> 8) & 0xF, 0);
+        // Speed = FULL at bits [13:12]
+        assert_eq!((ch >> 12) & 0x3, SPEED_FULL);
+        // DTC = 1 at bit 14 (control endpoint)
+        assert_eq!((ch >> 14) & 1, 1);
+        // Head = 0 at bit 15
+        assert_eq!((ch >> 15) & 1, 0);
+        // Max packet = 64 at bits [26:16]
+        assert_eq!((ch >> 16) & 0x7FF, 64);
+        // Control EP flag = 1 at bit 27 (FS control)
+        assert_eq!((ch >> 27) & 1, 1);
+        // NAK RL = 15 at bits [31:28]
+        assert_eq!((ch >> 28) & 0xF, 15);
+    }
+
+    #[test]
+    fn qh_char_bulk_high_speed() {
+        let ch = qh_characteristics(5, 2, SPEED_HIGH, 512, false, false);
+        assert_eq!(ch & 0x7F, 5); // address
+        assert_eq!((ch >> 8) & 0xF, 2); // endpoint
+        assert_eq!((ch >> 12) & 0x3, SPEED_HIGH); // speed
+        assert_eq!((ch >> 14) & 1, 0); // DTC=0 (not control)
+        assert_eq!((ch >> 16) & 0x7FF, 512); // max packet
+        assert_eq!((ch >> 27) & 1, 0); // control EP flag = 0 (HS)
+    }
+
+    #[test]
+    fn qh_char_control_high_speed_no_ctrl_flag() {
+        // HS control endpoint: DTC=1 but control EP flag should be 0
+        let ch = qh_characteristics(1, 0, SPEED_HIGH, 64, true, false);
+        assert_eq!((ch >> 14) & 1, 1); // DTC=1 (control)
+        assert_eq!((ch >> 27) & 1, 0); // ctrl_ep flag = 0 (HS doesn't set it)
+    }
+
+    #[test]
+    fn qh_char_head_of_reclamation() {
+        let ch = qh_characteristics(0, 0, SPEED_HIGH, 0, false, true);
+        assert_eq!((ch >> 15) & 1, 1); // head flag
+    }
+
+    #[test]
+    fn qh_char_low_speed_control() {
+        let ch = qh_characteristics(3, 0, SPEED_LOW, 8, true, false);
+        assert_eq!((ch >> 12) & 0x3, SPEED_LOW);
+        assert_eq!((ch >> 27) & 1, 1); // LS control → ctrl_ep flag set
+        assert_eq!((ch >> 16) & 0x7FF, 8);
+    }
+
+    // -----------------------------------------------------------------------
+    // QH Capabilities builder
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn qh_cap_async_no_split() {
+        let cap = qh_capabilities(0, 0, 0, 0, 1);
+        assert_eq!(cap & 0xFF, 0); // smask = 0
+        assert_eq!((cap >> 8) & 0xFF, 0); // cmask = 0
+        assert_eq!((cap >> 16) & 0x7F, 0); // hub addr = 0
+        assert_eq!((cap >> 23) & 0x7F, 0); // hub port = 0
+        assert_eq!((cap >> 30) & 0x3, 1); // mult = 1
+    }
+
+    #[test]
+    fn qh_cap_interrupt_with_split() {
+        let cap = qh_capabilities(0x04, 0x1C, 7, 1, 1);
+        assert_eq!(cap & 0xFF, 0x04); // smask
+        assert_eq!((cap >> 8) & 0xFF, 0x1C); // cmask
+        assert_eq!((cap >> 16) & 0x7F, 7); // hub addr
+        assert_eq!((cap >> 23) & 0x7F, 1); // hub port
+        assert_eq!((cap >> 30) & 0x3, 1); // mult
+    }
+
+    #[test]
+    fn qh_cap_high_bandwidth_mult() {
+        let cap = qh_capabilities(0, 0, 0, 0, 3);
+        assert_eq!((cap >> 30) & 0x3, 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // TransferDescriptor
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn td_new_is_terminated() {
+        let td = TransferDescriptor::new();
+        assert_eq!(td.next.read(), LINK_TERMINATE);
+        assert_eq!(td.alt_next.read(), LINK_TERMINATE);
+        assert_eq!(td.token.read(), 0);
+        for buf in &td.buffer {
+            assert_eq!(buf.read(), 0);
+        }
+    }
+
+    #[test]
+    fn td_default_matches_new() {
+        let a = TransferDescriptor::new();
+        let b = TransferDescriptor::default();
+        assert_eq!(a.next.read(), b.next.read());
+        assert_eq!(a.alt_next.read(), b.alt_next.read());
+        assert_eq!(a.token.read(), b.token.read());
+    }
+
+    #[test]
+    fn td_size_and_alignment() {
+        assert_eq!(mem::size_of::<TransferDescriptor>(), 32);
+        assert_eq!(mem::align_of::<TransferDescriptor>(), 32);
+    }
+
+    #[test]
+    fn td_init_sets_fields() {
+        let mut td = TransferDescriptor::new();
+        let buffer = [0u8; 64];
+        let tok = qtd_token(PID_IN, 64, true, true);
+
+        // SAFETY: buffer is valid for 64 bytes, td is local.
+        unsafe { td.init(tok, buffer.as_ptr(), 64) };
+
+        assert_eq!(td.next.read(), LINK_TERMINATE);
+        assert_eq!(td.alt_next.read(), LINK_TERMINATE);
+        assert_eq!(td.token.read(), tok);
+        assert_eq!(td.buffer[0].read(), buffer.as_ptr() as u32);
+    }
+
+    #[test]
+    fn td_is_complete_when_active_cleared() {
+        let td = TransferDescriptor::new();
+        td.token.write(QTD_TOKEN_ACTIVE);
+        assert!(!td.is_complete());
+
+        td.token.write(0); // active cleared
+        assert!(td.is_complete());
+    }
+
+    #[test]
+    fn td_has_error_flags() {
+        let td = TransferDescriptor::new();
+        td.token.write(0);
+        assert!(!td.has_error());
+
+        td.token.write(QTD_TOKEN_HALTED);
+        assert!(td.has_error());
+
+        td.token.write(QTD_TOKEN_BABBLE);
+        assert!(td.has_error());
+
+        td.token.write(QTD_TOKEN_XACT_ERR);
+        assert!(td.has_error());
+    }
+
+    #[test]
+    fn td_bytes_remaining() {
+        let td = TransferDescriptor::new();
+        let tok = qtd_token(PID_IN, 256, false, false);
+        td.token.write(tok);
+        assert_eq!(td.bytes_remaining(), 256);
+
+        // Simulate controller decrementing bytes
+        td.token.write(tok & !(0x7FFF << 16) | (128 << 16));
+        assert_eq!(td.bytes_remaining(), 128);
+    }
+
+    // -----------------------------------------------------------------------
+    // QueueHead
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn qh_new_is_terminated() {
+        let qh = QueueHead::new();
+        assert_eq!(qh.horizontal_link.read(), LINK_TERMINATE);
+        assert_eq!(qh.characteristics.read(), 0);
+        assert_eq!(qh.capabilities.read(), 0);
+        assert_eq!(qh.current_qtd.read(), 0);
+        assert_eq!(qh.overlay_next.read(), LINK_TERMINATE);
+        assert_eq!(qh.overlay_alt_next.read(), LINK_TERMINATE);
+        assert_eq!(qh.overlay_token.read(), 0);
+        assert_eq!(qh.sw_flags.read(), 0);
+    }
+
+    #[test]
+    fn qh_default_matches_new() {
+        let a = QueueHead::new();
+        let b = QueueHead::default();
+        assert_eq!(a.horizontal_link.read(), b.horizontal_link.read());
+        assert_eq!(a.characteristics.read(), b.characteristics.read());
+        assert_eq!(a.overlay_token.read(), b.overlay_token.read());
+    }
+
+    #[test]
+    fn qh_size_and_alignment() {
+        assert_eq!(mem::size_of::<QueueHead>(), 64);
+        assert_eq!(mem::align_of::<QueueHead>(), 64);
+    }
+
+    #[test]
+    fn qh_init_endpoint_sets_used_flag() {
+        let mut qh = QueueHead::new();
+        let ch = qh_characteristics(1, 0, SPEED_FULL, 64, true, false);
+        let cap = qh_capabilities(0, 0, 0, 0, 1);
+        qh.init_endpoint(ch, cap);
+
+        assert_eq!(qh.characteristics.read(), ch);
+        assert_eq!(qh.capabilities.read(), cap);
+        assert_eq!(qh.overlay_token.read(), QTD_TOKEN_HALTED);
+        assert_ne!(qh.sw_flags.read() & QH_FLAG_USED, 0);
+    }
+
+    #[test]
+    fn qh_attach_qtd_clears_halt() {
+        let mut qh = QueueHead::new();
+        let ch = qh_characteristics(1, 1, SPEED_HIGH, 512, false, false);
+        qh.init_endpoint(ch, qh_capabilities(0, 0, 0, 0, 1));
+        assert_ne!(qh.overlay_token.read() & QTD_TOKEN_HALTED, 0);
+
+        let td = TransferDescriptor::new();
+        // SAFETY: td is local, we're just testing pointer propagation.
+        unsafe { qh.attach_qtd(&td) };
+        assert_eq!(qh.overlay_next.read(), &td as *const _ as u32);
+        assert_eq!(qh.overlay_token.read(), 0); // halt cleared
+    }
+
+    #[test]
+    fn qh_set_overlay_toggle() {
+        let mut qh = QueueHead::new();
+        qh.overlay_token.write(0);
+
+        unsafe { qh.set_overlay_toggle(true) };
+        assert_eq!(qh.overlay_token.read() >> 31, 1);
+
+        unsafe { qh.set_overlay_toggle(false) };
+        assert_eq!(qh.overlay_token.read() >> 31, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // FrameList
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn frame_list_new_all_terminated() {
+        let fl = FrameList::new();
+        for entry in &fl.entries {
+            assert!(link_is_terminate(entry.read()));
+        }
+    }
+
+    #[test]
+    fn frame_list_default_matches_new() {
+        let fl = FrameList::default();
+        for entry in &fl.entries {
+            assert!(link_is_terminate(entry.read()));
+        }
+    }
+
+    #[test]
+    fn frame_list_length() {
+        assert_eq!(FRAME_LIST_LEN, 32);
+    }
+
+    #[test]
+    fn frame_list_size_and_alignment() {
+        assert_eq!(mem::size_of::<FrameList>(), 4096);
+        assert_eq!(mem::align_of::<FrameList>(), 4096);
+    }
+
+    // -----------------------------------------------------------------------
+    // Constants sanity checks
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn error_mask_covers_all_error_bits() {
+        assert_ne!(QTD_TOKEN_ERROR_MASK & QTD_TOKEN_HALTED, 0);
+        assert_ne!(QTD_TOKEN_ERROR_MASK & QTD_TOKEN_BUFFER_ERR, 0);
+        assert_ne!(QTD_TOKEN_ERROR_MASK & QTD_TOKEN_BABBLE, 0);
+        assert_ne!(QTD_TOKEN_ERROR_MASK & QTD_TOKEN_XACT_ERR, 0);
+        assert_ne!(QTD_TOKEN_ERROR_MASK & QTD_TOKEN_MISSED_UFRAME, 0);
+        // Active bit should NOT be in error mask
+        assert_eq!(QTD_TOKEN_ERROR_MASK & QTD_TOKEN_ACTIVE, 0);
+    }
+
+    #[test]
+    fn status_mask_covers_full_byte() {
+        assert_eq!(QTD_TOKEN_STATUS_MASK, 0xFF);
+    }
+
+    #[test]
+    fn pid_codes_are_distinct() {
+        assert_ne!(PID_OUT, PID_IN);
+        assert_ne!(PID_IN, PID_SETUP);
+        assert_ne!(PID_OUT, PID_SETUP);
+    }
+
+    #[test]
+    fn speed_codes_are_distinct() {
+        assert_ne!(SPEED_FULL, SPEED_LOW);
+        assert_ne!(SPEED_LOW, SPEED_HIGH);
+        assert_ne!(SPEED_FULL, SPEED_HIGH);
+    }
+}

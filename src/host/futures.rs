@@ -40,7 +40,9 @@ impl Future for TransferComplete<'_> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // Register waker with the appropriate pipe waker slot.
-        self.shared.pipe_waker(self.waker_index).register(cx.waker());
+        self.shared
+            .pipe_waker(self.waker_index)
+            .register(cx.waker());
 
         // Derive pointers from pool indices for cache maintenance + reads.
         let status_qtd_ptr = self.statics.qtd_ptr(self.status_qtd_index);
@@ -75,7 +77,10 @@ impl Future for TransferComplete<'_> {
             // SAFETY: qh_ptr from statics pool, cache invalidated above.
             let overlay = unsafe { (*qh_ptr).overlay_token.read() };
             if overlay & QTD_TOKEN_HALTED != 0 {
-                debug!("[HC] TransferComplete: QH overlay halted (overlay=0x{:08x}), aborting", overlay);
+                debug!(
+                    "[HC] TransferComplete: QH overlay halted (overlay=0x{:08x}), aborting",
+                    overlay
+                );
                 return Poll::Ready(Err(Imxrt1062HostController::map_qtd_error(overlay)));
             }
 
@@ -85,18 +90,20 @@ impl Future for TransferComplete<'_> {
                 let data_token = unsafe { (*dp).token.read() };
                 if data_token & QTD_TOKEN_HALTED != 0 {
                     // Data phase halted — map error
-                    return Poll::Ready(Err(Imxrt1062HostController::map_qtd_error(
-                        data_token,
-                    )));
+                    return Poll::Ready(Err(Imxrt1062HostController::map_qtd_error(data_token)));
                 }
             }
 
             // Re-enable transfer completion interrupts
-            ral::modify_reg!(ral::usb, self.usb, USBINTR, |v| v
+            ral::modify_reg!(
+                ral::usb,
+                self.usb,
+                USBINTR,
+                |v| v
                 | (1 << 0)   // UE
                 | (1 << 1)   // UEE
                 | (1 << 18)  // UAIE
-                | (1 << 19)  // UPIE
+                | (1 << 19) // UPIE
             );
             return Poll::Pending;
         }
@@ -111,16 +118,13 @@ impl Future for TransferComplete<'_> {
             // SAFETY: data qTD pointer from statics pool, cache invalidated above.
             let data_token = unsafe { (*dp).token.read() };
             if data_token & ehci::QTD_TOKEN_ERROR_MASK != 0 {
-                return Poll::Ready(Err(Imxrt1062HostController::map_qtd_error(
-                    data_token,
-                )));
+                return Poll::Ready(Err(Imxrt1062HostController::map_qtd_error(data_token)));
             }
         }
 
         Poll::Ready(Ok(()))
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // AsyncAdvanceWait — future for async advance doorbell

@@ -1,5 +1,6 @@
 # imxrt-usbh
 
+[![CI](https://github.com/imxrt-rs/imxrt-usbh/actions/workflows/ci.yml/badge.svg)](https://github.com/imxrt-rs/imxrt-usbh/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](https://opensource.org/licenses/MIT)
 
 ## A USB Host Controller Driver for i.MX RT Microcontrollers
@@ -62,15 +63,19 @@ Add the crate to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-imxrt-usbh = { path = "../imxrt-usbh" }  # or git URL
-cotton-usb-host = "0.2"
+imxrt-usbh = "0.1"
+imxrt-ral = { version = "0.6", features = ["imxrt1062"] }
 ```
+
+> **Note:** `cotton-usb-host` types (`UsbBus`, `DeviceEvent`, descriptor types,
+> etc.) are re-exported at the crate root, so you do **not** need to add
+> `cotton-usb-host` as a direct dependency.
 
 ### Minimal Example
 
 ```rust,ignore
 use imxrt_usbh::host::{Imxrt1062HostController, UsbShared, UsbStatics};
-use cotton_usb_host::usb_bus::UsbBus;
+use imxrt_usbh::usb_bus::UsbBus;
 use static_cell::ConstStaticCell;
 
 // Static resources — must live for 'static
@@ -79,7 +84,9 @@ static STATICS: ConstStaticCell<UsbStatics> = ConstStaticCell::new(UsbStatics::n
 
 // In your init code (after configuring USB2 PLL and clock gates):
 let statics = STATICS.take();
-let host = Imxrt1062HostController::new(peripherals, &SHARED, statics);
+let usb2 = unsafe { imxrt_ral::usb::USB2::instance() };
+let usbphy2 = unsafe { imxrt_ral::usbphy::USBPHY2::instance() };
+let host = Imxrt1062HostController::new(usb2, usbphy2, &SHARED, statics);
 unsafe { host.init() };
 
 // Create the USB bus and handle device events
@@ -88,8 +95,9 @@ let mut events = usb_bus.device_events_no_hubs();
 // ... poll events in an async task
 ```
 
-The `peripherals` argument must implement the [`Peripherals`](imxrt_usbh::Peripherals)
-trait. See the trait documentation for how to provide USB register block pointers.
+The `Imxrt1062HostController::new()` method takes `imxrt-ral` register instances
+directly. Enable a chip feature on `imxrt-ral` (e.g. `imxrt1062`) to get the
+correct register definitions.
 
 ### Clock Prerequisites
 
@@ -125,26 +133,33 @@ imxrt-usbh = { path = "../imxrt-usbh", features = ["hub-support"] }
 
 ## Examples
 
-All examples target the Teensy 4.1 and log over USB CDC serial on the
-programming port (USB1). Build with:
+Hardware examples live in the [`imxrt-hal`](https://github.com/imxrt-rs/imxrt-hal)
+repository, which provides the board support infrastructure (clock setup, pin
+muxing, logging). All examples target the **Teensy 4.1** and log over USB CDC serial.
+
+Build from the `imxrt-hal` repo root:
 
 ```sh
-cargo build --release --target thumbv7em-none-eabihf --example <name>
-rust-objcopy -O ihex target/thumbv7em-none-eabihf/release/examples/<name> <name>.hex
+cargo build --example rtic_usb_host_enumerate --features=board/teensy4 --target=thumbv7em-none-eabihf
 ```
 
 Flash with:
 
 ```sh
-teensy_loader_cli --mcu=TEENSY41 -w -v <name>.hex
+rust-objcopy -O ihex target/thumbv7em-none-eabihf/debug/examples/rtic_usb_host_enumerate fw.hex
+teensy_loader_cli --mcu=TEENSY41 -w -v fw.hex
 ```
 
 | Example | Description |
 |---------|-------------|
-| [`rtic_usb_enumerate`](examples/rtic_usb_enumerate.rs) | Device detection and enumeration — logs VID/PID on connect |
-| [`rtic_usb_hid_keyboard`](examples/rtic_usb_hid_keyboard.rs) | HID keyboard input — decodes keycodes, flashes LED in morse code (no hub support) |
-| [`rtic_usb_hub`](examples/rtic_usb_hub.rs) | Hub enumeration — discovers devices behind a hub, logs HID reports (requires `--features hub-support`) |
-| [`rtic_usb_mass_storage`](examples/rtic_usb_mass_storage.rs) | Mass storage sector read — SCSI READ(10) over bulk transport |
+| `rtic_usb_host_enumerate` | Device detection and enumeration — logs VID/PID on connect |
+| `rtic_usb_host_hid_keyboard` | HID keyboard input — decodes keycodes, flashes LED in morse code |
+| `rtic_usb_host_hub` | Hub enumeration — discovers devices behind a hub (requires `imxrt-usbh/hub-support`) |
+| `rtic_usb_host_mass_storage` | Mass storage sector read — SCSI READ(10) over bulk transport |
+
+For local development, the `imxrt-hal` workspace uses a path dependency on
+this crate. Changes to `imxrt-usbh` are picked up automatically when building
+examples.
 
 ## Limitations
 

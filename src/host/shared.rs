@@ -36,7 +36,14 @@ pub struct UsbShared {
     async_advance_waker: CriticalSectionWakerRegistration,
 }
 
+impl Default for UsbShared {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UsbShared {
+    #[allow(clippy::declare_interior_mutable_const)]
     const WAKER: CriticalSectionWakerRegistration = CriticalSectionWakerRegistration::new();
 
     /// Create a new `UsbShared` instance.
@@ -121,7 +128,7 @@ impl UsbShared {
     /// - `usb_base` must point to a valid USB OTG register block.
     pub unsafe fn on_usb_irq(&self, usb_base: *const ()) {
         let usb = ral::usb::Instance {
-            addr: usb_base.cast(),
+            addr: usb_base as *const ral::usb::RegisterBlock,
         };
         // Safety: caller guarantees usb_base points to a valid register block.
         unsafe { self.on_irq(&usb) };

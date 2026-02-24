@@ -5,7 +5,7 @@
 //! - [`UsbShared`](crate::host::UsbShared) — interrupt-safe state shared between ISR and async tasks.
 //! - [`UsbStatics`](crate::host::UsbStatics) — static-lifetime resource pools (not shared with ISR).
 //! - [`Imxrt1062HostController`](crate::host::Imxrt1062HostController) — the main controller implementing
-//!   [`HostController`](cotton_usb_host::host_controller::HostController).
+//!   [`HostController`](crate::host_controller::HostController).
 //!
 //! # Architecture
 //!
@@ -39,25 +39,25 @@
 // Submodules
 // ---------------------------------------------------------------------------
 
+mod controller;
+mod device_detect;
+mod futures;
+mod interrupt_pipe;
+mod schedule;
 mod shared;
 mod statics;
-mod controller;
-mod schedule;
-mod transfer;
-mod futures;
-mod device_detect;
-mod interrupt_pipe;
 mod trait_impl;
+mod transfer;
 
 // ---------------------------------------------------------------------------
 // Re-exports (public API)
 // ---------------------------------------------------------------------------
 
-pub use shared::UsbShared;
-pub use statics::{RecvBuf, UsbStatics};
 pub use controller::Imxrt1062HostController;
 pub use device_detect::Imxrt1062DeviceDetect;
 pub use interrupt_pipe::Imxrt1062InterruptPipe;
+pub use shared::UsbShared;
+pub use statics::{RecvBuf, UsbStatics};
 
 // ---------------------------------------------------------------------------
 // Pool sizing constants
@@ -81,6 +81,3 @@ pub const NUM_QTD: usize = 16;
 /// Must be >= `NUM_QH + 1` (control pipe at index 0, bulk/interrupt at indices 1..N).
 /// We use NUM_QH + 1 to match: 1 control + NUM_QH bulk/interrupt slots.
 const NUM_PIPE_WAKERS: usize = NUM_QH + 1;
-
-
-

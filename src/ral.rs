@@ -1,53 +1,99 @@
 //! Register access layer for USB host mode.
 //!
-//! These definitions are vendored from `imxrt-usbd` (which itself derives from
-//! `imxrt-ral`) because the upstream `imxrt-ral` crate models USB registers for
-//! device mode only. The EHCI host-mode registers (ASYNCLISTADDR,
-//! PERIODICLISTBASE, PORTSC1 host bits, FRINDEX, etc.) are either absent or
-//! incorrect in the SVD-generated definitions. Additionally, the [`Instance`]
-//! types here implement `Send`, which is required for sharing register access
-//! across async task boundaries and ISR contexts.
+//! Re-exports register definitions from `imxrt-ral` for USB core and PHY
+//! peripherals. Provides thin `Instance` wrapper types that erase the
+//! const-generic instance number from `imxrt-ral`, keeping the rest of
+//! the driver non-generic.
 //!
-//! If `imxrt-ral` gains proper USB host-mode support in the future, these
-//! files should be replaced with upstream imports.
+//! The `ral-registers` macros (`read_reg!`/`write_reg!`/`modify_reg!`) are
+//! re-exported from `imxrt-ral` and work with these wrapper types because
+//! they implement `Deref<Target = RegisterBlock>`.
 //!
-//! The `ral-registers` crate provides the `read_reg!`/`write_reg!`/`modify_reg!`
-//! macros used throughout.
-//!
-//! The USB core register block (`usb::RegisterBlock`) includes both device-mode and
-//! host-mode field definitions at the same offsets. Key host-mode mappings:
+//! The USB core register block includes both device-mode and host-mode field
+//! definitions at the same offsets. Key host-mode mappings:
 //!
 //! | EHCI Name | RAL Register | RAL Field | Purpose |
 //! |-----------|-------------|-----------|---------|
-//! | `PERIODICLISTBASE` | `DEVICEADDR` | `BASEADR` | Periodic frame list base address |
+//! | `PERIODICLISTBASE` | `DEVICEADDR` | (raw write) | Periodic frame list base address |
 //! | `ASYNCLISTADDR` | `ASYNCLISTADDR` | `ASYBASE` | Async schedule list pointer |
 //! | `PORTSC` | `PORTSC1` | `PSPD`, `CCS`, `PE`, etc. | Port status and control |
 
-pub mod usb;
-pub mod usbphy;
+pub use imxrt_ral::{modify_reg, read_reg, write_reg};
 
-pub use ral_registers::{modify_reg, read_reg, write_reg, RORegister, RWRegister};
+/// USB OTG core registers and field definitions.
+///
+/// All register field sub-modules (`USBCMD`, `PORTSC1`, `USBSTS`, etc.) are
+/// re-exported from `imxrt-ral`. The [`Instance`] type is a non-generic
+/// wrapper that erases `imxrt-ral`'s const-generic instance number.
+pub mod usb {
+    // Glob-import all register field modules and RegisterBlock from imxrt-ral.
+    // Our local `Instance` struct shadows `imxrt_ral::usb::Instance<N>`.
+    pub use imxrt_ral::usb::*;
 
-use crate::Peripherals;
+    /// A non-generic USB register instance.
+    ///
+    /// Wraps a raw pointer to `RegisterBlock`, providing `Deref` so it works
+    /// with `read_reg!`/`write_reg!`/`modify_reg!` macros. This erases the
+    /// const-generic `N` from `imxrt_ral::Instance<T, N>` so the driver's
+    /// internal types don't need to be generic over the instance number.
+    pub struct Instance {
+        pub(crate) addr: *const RegisterBlock,
+    }
 
-/// Typed register block instances for USB core and PHY peripherals.
-pub struct Instances {
-    /// USB OTG core registers (EHCI-compatible).
-    pub usb: usb::Instance,
-    /// USB PHY registers.
-    pub usbphy: usbphy::Instance,
+    impl Instance {
+        /// Create a wrapper from a typed `imxrt-ral` USB instance.
+        pub fn from_ral<const N: u8>(inst: imxrt_ral::usb::Instance<N>) -> Self {
+            // Extract the pointer before the instance is consumed.
+            let ptr: &RegisterBlock = &inst;
+            Self {
+                addr: ptr as *const RegisterBlock,
+            }
+        }
+    }
+
+    impl core::ops::Deref for Instance {
+        type Target = RegisterBlock;
+        #[inline]
+        fn deref(&self) -> &Self::Target {
+            unsafe { &*self.addr }
+        }
+    }
+
+    // Safety: Instance holds a pointer to static MMIO registers.
+    // The driver is designed for single-task usage with ISR synchronization.
+    unsafe impl Send for Instance {}
 }
 
-/// Convert a [`Peripherals`] implementation into typed register block instances.
+/// USB PHY registers and field definitions.
 ///
-/// This consumes the `Peripherals` and returns [`Instances`] with typed pointers
-/// to the USB core and PHY register blocks.
-pub fn instances<P: Peripherals>(peripherals: P) -> Instances {
-    let usb = usb::Instance {
-        addr: peripherals.usb().cast(),
-    };
-    let usbphy = usbphy::Instance {
-        addr: peripherals.usbphy().cast(),
-    };
-    Instances { usb, usbphy }
+/// All register field sub-modules (`PWD`, `CTRL_SET`, `CTRL_CLR`, etc.) are
+/// re-exported from `imxrt-ral`. The [`Instance`] type is a non-generic
+/// wrapper analogous to [`usb::Instance`].
+pub mod usbphy {
+    pub use imxrt_ral::usbphy::*;
+
+    /// A non-generic USBPHY register instance.
+    pub struct Instance {
+        pub(crate) addr: *const RegisterBlock,
+    }
+
+    impl Instance {
+        /// Create a wrapper from a typed `imxrt-ral` USBPHY instance.
+        pub fn from_ral<const N: u8>(inst: imxrt_ral::usbphy::Instance<N>) -> Self {
+            let ptr: &RegisterBlock = &inst;
+            Self {
+                addr: ptr as *const RegisterBlock,
+            }
+        }
+    }
+
+    impl core::ops::Deref for Instance {
+        type Target = RegisterBlock;
+        #[inline]
+        fn deref(&self) -> &Self::Target {
+            unsafe { &*self.addr }
+        }
+    }
+
+    unsafe impl Send for Instance {}
 }

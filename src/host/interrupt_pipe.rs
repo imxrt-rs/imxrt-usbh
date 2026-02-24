@@ -5,7 +5,7 @@ use crate::{cache, ral};
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use cotton_usb_host::host_controller::InterruptPacket;
-use futures::Stream;
+use futures_core::Stream;
 
 use super::controller::Imxrt1062HostController;
 use super::schedule::QtdSlot;
@@ -93,7 +93,7 @@ impl Stream for Imxrt1062InterruptPipe {
 
         // Reconstruct Instance from base address (cheap, no allocation).
         let usb_inst = ral::usb::Instance {
-            addr: self.usb_base as *const _,
+            addr: self.usb_base as *const ral::usb::RegisterBlock,
         };
 
         // Invalidate cache to see any hardware updates to the qTD token.
@@ -106,11 +106,15 @@ impl Stream for Imxrt1062InterruptPipe {
 
         if token & ehci::QTD_TOKEN_ACTIVE != 0 {
             // Transfer still in progress — re-enable transfer interrupts and wait.
-            ral::modify_reg!(ral::usb, usb_inst, USBINTR, |v| v
+            ral::modify_reg!(
+                ral::usb,
+                usb_inst,
+                USBINTR,
+                |v| v
                 | (1 << 0)   // UE
                 | (1 << 1)   // UEE
                 | (1 << 18)  // UAIE
-                | (1 << 19)  // UPIE
+                | (1 << 19) // UPIE
             );
             return Poll::Pending;
         }
@@ -191,11 +195,15 @@ impl Stream for Imxrt1062InterruptPipe {
         Imxrt1062HostController::cache_clean_qh(qh_ptr);
 
         // Re-enable transfer interrupts so the next completion wakes us.
-        ral::modify_reg!(ral::usb, usb_inst, USBINTR, |v| v
+        ral::modify_reg!(
+            ral::usb,
+            usb_inst,
+            USBINTR,
+            |v| v
             | (1 << 0)   // UE
             | (1 << 1)   // UEE
             | (1 << 18)  // UAIE
-            | (1 << 19)  // UPIE
+            | (1 << 19) // UPIE
         );
 
         Poll::Ready(Some(packet))
@@ -229,6 +237,7 @@ impl Drop for Imxrt1062InterruptPipe {
         // to this QH for the current frame. A ~1 ms busy-wait (one EHCI frame
         // at full speed = 1 ms) ensures no further DMA accesses will occur
         // before we release the memory.
+        #[cfg(target_os = "none")]
         cortex_m::asm::delay(600_000); // 1 ms at 600 MHz
 
         // 3. qTD cleanup is handled automatically by QtdSlot::drop() when
@@ -245,5 +254,3 @@ impl Drop for Imxrt1062InterruptPipe {
         //    - `self.pipe` drops → returns the bulk_pipes pool slot
     }
 }
-
-
