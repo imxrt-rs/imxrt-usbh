@@ -1,7 +1,7 @@
 //! Static-lifetime resource pools and DMA receive buffers.
 
-use core::cell::{Cell, UnsafeCell};
 use crate::ehci::{FrameList, QueueHead, TransferDescriptor};
+use core::cell::{Cell, UnsafeCell};
 use cotton_usb_host::async_pool::Pool;
 
 use super::{NUM_QH, NUM_QTD};
@@ -17,6 +17,12 @@ use super::{NUM_QH, NUM_QTD};
 /// adjacent data in the same cache line.
 #[repr(C, align(32))]
 pub struct RecvBuf(pub [u8; 64]);
+
+impl Default for RecvBuf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl RecvBuf {
     /// Create a zeroed receive buffer.
@@ -125,10 +131,17 @@ pub struct UsbStatics {
     pub recv_bufs: [RecvBuf; NUM_QH - 1],
 }
 
+impl Default for UsbStatics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UsbStatics {
     /// Create a new `UsbStatics` with all resources free and structures zeroed.
     ///
     /// This is `const` so it can be placed in a `static`.
+    #[allow(clippy::declare_interior_mutable_const)]
     pub const fn new() -> Self {
         Self {
             control_pipes: Pool::new(1),
@@ -139,12 +152,12 @@ impl UsbStatics {
                 [QH; NUM_QH + 1]
             },
             qtd_pool: {
-                const QTD: UnsafeCell<TransferDescriptor> = UnsafeCell::new(TransferDescriptor::new());
+                const QTD: UnsafeCell<TransferDescriptor> =
+                    UnsafeCell::new(TransferDescriptor::new());
                 [QTD; NUM_QTD]
             },
             frame_list: FrameList::new(),
             qtd_allocated: {
-                // Cell<bool> doesn't have a const new(), so use array init
                 const FREE: Cell<bool> = Cell::new(false);
                 [FREE; NUM_QTD]
             },

@@ -50,7 +50,14 @@ impl HostController for Imxrt1062HostController {
         // Allocate a control pipe (serializes control transfers)
         let _pipe = Pipe::new(self.statics.control_pipes.alloc().await, 0);
 
-        let result = self.do_control_transfer(address, transfer_extras, packet_size, &setup, &mut data_phase)
+        let result = self
+            .do_control_transfer(
+                address,
+                transfer_extras,
+                packet_size,
+                &setup,
+                &mut data_phase,
+            )
             .await;
 
         if let Ok(n) = &result {

@@ -1,18 +1,30 @@
-//! Cache maintenance operations
+//! Cache maintenance operations.
 //!
-//! These functions were adapted from the cortex-m (0.7.1) crate.
-//! cortex-m only lets you access these functions when you have
-//! the SCB in cortex_m::Peripherals collection. But, we neither want
-//! to steal the peripheral(s), nor own them. So, we're duplicating
-//! the routines that we need, and making sure that we're using
-//! them safely.
+//! On `target_os = "none"` (ARM embedded), these perform real D-cache
+//! clean/invalidate via Cortex-M CBP registers. On host targets (for
+//! testing), they are no-ops since there is no DMA engine.
 //!
-//! cortex-m crate available at <https://github.com/rust-embedded/cortex-m>.
+//! The ARM implementation was adapted from the cortex-m (0.7.1) crate.
+//! cortex-m only lets you access these functions when you have the SCB
+//! in `cortex_m::Peripherals`. We duplicate the routines we need so the
+//! driver doesn't need to own or steal the peripheral collection.
 //!
-//! See <https://github.com/rust-embedded/cortex-m/issues/304>, and also #239.
-//!
-//! <https://github.com/rust-embedded/cortex-m/pull/320> indicates that this might
-//! be available in a near-future cortex-m crate.
+//! See <https://github.com/rust-embedded/cortex-m/issues/304> and
+//! <https://github.com/rust-embedded/cortex-m/pull/320>.
+
+// ---------------------------------------------------------------------------
+// Host target: no-op stubs (no DMA engine)
+// ---------------------------------------------------------------------------
+
+#[cfg(not(target_os = "none"))]
+pub fn invalidate_dcache_by_address(_addr: usize, _size: usize) {}
+
+#[cfg(not(target_os = "none"))]
+pub fn clean_invalidate_dcache_by_address(_addr: usize, _size: usize) {}
+
+// ---------------------------------------------------------------------------
+// ARM embedded target: real cache maintenance
+// ---------------------------------------------------------------------------
 
 /// Invalidates D-cache by address (discard only, no write-back).
 ///
@@ -30,6 +42,7 @@
 /// It is recommended that `addr` is aligned to the cache line size and `size`
 /// is a multiple of the cache line size, otherwise surrounding data will also
 /// be invalidated.
+#[cfg(target_os = "none")]
 pub fn invalidate_dcache_by_address(addr: usize, size: usize) {
     // No-op zero sized operations
     if size == 0 {
@@ -71,6 +84,7 @@ pub fn invalidate_dcache_by_address(addr: usize, size: usize) {
 /// Cleaning and invalidating causes data in the D-cache to be written back to main memory,
 /// and then marks that data in the D-cache as invalid, causing future reads to first fetch
 /// from main memory.
+#[cfg(target_os = "none")]
 pub fn clean_invalidate_dcache_by_address(addr: usize, size: usize) {
     // No-op zero sized operations
     if size == 0 {

@@ -12,7 +12,7 @@ use super::statics::UsbStatics;
 /// USB host controller for i.MX RT 1062.
 ///
 /// This is the main driver type that implements the
-/// [`HostController`](cotton_usb_host::host_controller::HostController) trait.
+/// [`HostController`](crate::host_controller::HostController) trait.
 /// It owns the USB register blocks and holds references to the shared and
 /// static resources.
 ///
@@ -44,7 +44,9 @@ use super::statics::UsbStatics;
 /// static STATICS: StaticCell<UsbStatics> = StaticCell::new();
 ///
 /// let statics = STATICS.init(UsbStatics::new());
-/// let host = Imxrt1062HostController::new(peripherals, &SHARED, statics);
+/// let usb = unsafe { imxrt_ral::usb::USB2::instance() };
+/// let usbphy = unsafe { imxrt_ral::usbphy::USBPHY2::instance() };
+/// let host = Imxrt1062HostController::new(usb, usbphy, &SHARED, statics);
 /// ```
 pub struct Imxrt1062HostController {
     /// USB OTG core registers (owned).
@@ -68,28 +70,29 @@ pub struct Imxrt1062HostController {
 unsafe impl Send for Imxrt1062HostController {}
 
 impl Imxrt1062HostController {
-    /// Create a new host controller from peripheral instances and static resources.
+    /// Create a new host controller from `imxrt-ral` register instances and
+    /// static resources.
     ///
     /// # Arguments
     ///
-    /// - `peripherals` — implementation of [`Peripherals`](crate::Peripherals) providing
-    ///   register block pointers
+    /// - `usb` — `imxrt-ral` USB OTG register instance (e.g. `USB2::instance()`)
+    /// - `usbphy` — `imxrt-ral` USBPHY register instance (e.g. `USBPHY2::instance()`)
     /// - `shared` — reference to [`UsbShared`] in a `static`
     /// - `statics` — reference to [`UsbStatics`] in a `static`
     ///
     /// # Note
     ///
-    /// This does **not** initialise the hardware. Call `init()` (phase 1.3)
-    /// after construction to set up the controller.
-    pub fn new<P: crate::Peripherals>(
-        peripherals: P,
+    /// This does **not** initialise the hardware. Call `init()` after
+    /// construction to set up the controller.
+    pub fn new<const N: u8>(
+        usb: imxrt_ral::usb::Instance<N>,
+        usbphy: imxrt_ral::usbphy::Instance<N>,
         shared: &'static UsbShared,
         statics: &'static UsbStatics,
     ) -> Self {
-        let instances = ral::instances(peripherals);
         Self {
-            usb: instances.usb,
-            usbphy: instances.usbphy,
+            usb: ral::usb::Instance::from_ral(usb),
+            usbphy: ral::usbphy::Instance::from_ral(usbphy),
             shared,
             statics,
         }
@@ -269,7 +272,7 @@ impl Imxrt1062HostController {
             | (0b11 << 8)            // ASP: async park count = 3
             | (1 << 11)              // ASPE: async park mode enable
             | (1 << 15)              // FS_2: frame list size high bit
-            | (1 << 16);             // ITC: 1 micro-frame threshold
+            | (1 << 16); // ITC: 1 micro-frame threshold
         ral::write_reg!(ral::usb, self.usb, USBCMD, usbcmd);
 
         // ---- Step 9: Enable port power ----
@@ -382,11 +385,15 @@ impl Imxrt1062HostController {
     /// Re-enables: UE (bit 0), UEE (bit 1), UAIE (bit 18), UPIE (bit 19).
     #[allow(dead_code)]
     pub(super) fn reenable_transfer_interrupts(&self) {
-        ral::modify_reg!(ral::usb, self.usb, USBINTR, |v| v
+        ral::modify_reg!(
+            ral::usb,
+            self.usb,
+            USBINTR,
+            |v| v
             | (1 << 0)   // UE
             | (1 << 1)   // UEE
             | (1 << 18)  // UAIE
-            | (1 << 19)  // UPIE
+            | (1 << 19) // UPIE
         );
     }
 

@@ -4,14 +4,16 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-cortex-m = "0.7"
-ral-registers = "0.1"
 bitflags = "2"
-cotton-usb-host = { path = "../cotton/cotton-usb-host", default-features = false }
-futures = { version = "0.3", default-features = false }
+cotton-usb-host = { version = "0.2.1", default-features = false }
+futures-core = { version = "0.3", default-features = false }
+imxrt-ral = "0.6"
 rtic-common = "1"
 critical-section = "1.1"
 log = { version = "0.4", optional = true }
+
+[target.'cfg(target_os = "none")'.dependencies]
+cortex-m = "0.7"
 
 [dependencies.defmt-03]
 package = "defmt"
@@ -23,26 +25,6 @@ default = ["log"]
 defmt-03 = ["dep:defmt-03"]
 log = ["dep:log"]
 hub-support = []
-
-[profile.release]
-debug = true
-
-[dev-dependencies]
-defmt = "0.3"
-imxrt-hal = { path = "../imxrt-hal", features = [ "imxrt1060" ] }
-imxrt-iomuxc = { version = "0.3.0", features = ["imxrt1060"] }
-imxrt-ral = { version = "0.6.1", features = ["imxrt1062"] }
-teensy4-fcb = "0.4.0"
-teensy4-panic = "0.2.3"
-imxrt-log = { path = "../imxrt-hal/logging", default-features = false, features = [
-    "log",
-    "lpuart",
-    "usbd",
-] }
-board = { path = "../imxrt-hal/board", features = [ "teensy4" ]}
-imxrt-rt = "0.1.7"
-rtic = { version = "2.0", features = ["thumbv7-backend"] }
-log = "0.4"
 
 [package.metadata.docs.rs]
 default-target = "thumbv7em-none-eabihf"

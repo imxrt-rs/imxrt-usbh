@@ -67,7 +67,7 @@ implementation in cotton-usb-host:
 | Crate | Purpose |
 |-------|---------|
 | `cotton-usb-host` (0.2.1+) | `HostController` trait, `UsbBus`, `Pool`/`Pooled` allocation |
-| `ral-registers` (0.1) | `read_reg!`/`write_reg!`/`modify_reg!` macros for register access |
+| `imxrt-ral` (0.6) | Register definitions and `read_reg!`/`write_reg!`/`modify_reg!` macros |
 | `cortex-m` (0.7+) | Cache management intrinsics, memory barriers |
 | `rtic-common` (1) | `CriticalSectionWakerRegistration` for ISR↔async waker communication |
 | `static-cell` | `ConstStaticCell` for `'static` lifetime pools |
@@ -79,17 +79,14 @@ implementation in cotton-usb-host:
 
 ```
 src/
-├── lib.rs              — Crate root: #![no_std], Peripherals trait, module declarations
+├── lib.rs              — Crate root: #![no_std], module declarations, cotton re-exports
 ├── ehci.rs             — EHCI DMA structures: QueueHead, TransferDescriptor, FrameList,
 │                         link pointer helpers, token/characteristic builders (~590 lines)
 ├── cache.rs            — D-cache clean + invalidate wrappers for DMA coherency
 ├── vcell.rs            — VCell<T>: volatile cell using UnsafeCell for DMA-visible structures
 ├── gpt.rs              — USB OTG built-in general purpose timer abstraction
 ├── log.rs              — Conditional defmt/log macros (feature-gated)
-├── ral.rs              — RAL glue: re-exports, Instances struct, instances() converter
-├── ral/
-│   ├── usb.rs          — USB OTG core register definitions (from imxrt-usbd)
-│   └── usbphy.rs       — USB PHY register definitions (from imxrt-usbd)
+├── ral.rs              — RAL adapter: re-exports from imxrt-ral, non-generic Instance wrappers
 └── host/
     ├── mod.rs           — Module declarations, re-exports, pool sizing constants
     ├── shared.rs        — UsbShared: ISR↔async bridge, on_irq(), wakers
@@ -270,8 +267,8 @@ where the interrupt fires between enable and register.
 
 ### ISR Binding
 
-Examples use manual ISR installation (vector table patching at address
-`0x2000_0000 + 16*4 + 112*4` for `USB_OTG2` IRQ #112) rather than RTIC
+The hardware examples (in `imxrt-hal`) use manual ISR installation (vector table
+patching at address `0x2000_0000 + 16*4 + 112*4` for `USB_OTG2` IRQ #112) rather than RTIC
 `#[task(binds = USB_OTG2)]`. This is because RTIC's dispatchers use different
 interrupts. The public API for the ISR is `UsbShared::on_usb_irq(usb_base)`,
 which avoids exposing RAL types to application code.
@@ -326,12 +323,18 @@ For a comprehensive treatment, see `docs/design/CACHE_COHERENCY.md`.
 
 ## Register Access (RAL Module)
 
-The RAL (Register Abstraction Layer) module is **copied from `imxrt-usbd`**, not
-from upstream `imxrt-ral`. It uses `ral-registers` v0.1 for the `read_reg!` /
-`write_reg!` / `modify_reg!` macros.
+The RAL module uses `imxrt-ral` 0.6 for register definitions and the
+`read_reg!` / `write_reg!` / `modify_reg!` macros (from `ral-registers`,
+re-exported by `imxrt-ral`).
 
-The key advantage is that all host-mode register fields are already defined,
-including aliases that don't exist in the upstream `imxrt-ral` crate:
+The `src/ral.rs` adapter module glob-imports all register field definitions
+from `imxrt_ral::usb` and `imxrt_ral::usbphy`, then provides non-generic
+`Instance` wrapper types that shadow the const-generic
+`imxrt_ral::Instance<T, N>`. This lets the rest of the driver avoid being
+generic over the USB instance number while still working with the
+`read_reg!`/`write_reg!`/`modify_reg!` macros.
+
+All host-mode register fields are present in `imxrt-ral`:
 
 | EHCI Spec Name | RAL Name | Notes |
 |----------------|----------|-------|
@@ -401,7 +404,8 @@ Before calling `Imxrt1062HostController::init()`:
 2. **Clock gate**: Enable USB OTG2 in `CCM_CCGR6`.
 3. **VBUS GPIO**: Drive `GPIO_EMC_40` HIGH as shown above.
 
-See the RTIC examples for complete initialization sequences using the `board` crate.
+See the RTIC examples in the `imxrt-hal` repository for complete initialization
+sequences using the `board` crate.
 
 ---
 

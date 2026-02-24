@@ -4,20 +4,18 @@
 //! appropriate schedule, and wait for completion.
 
 use crate::ehci::{
-    self, QueueHead, TransferDescriptor, PID_IN, PID_OUT, PID_SETUP,
-    SPEED_FULL, SPEED_HIGH, SPEED_LOW,
+    self, QueueHead, TransferDescriptor, PID_IN, PID_OUT, PID_SETUP, SPEED_FULL, SPEED_HIGH,
+    SPEED_LOW,
 };
 use crate::{cache, ral};
 use core::cell::Cell;
-use cotton_usb_host::host_controller::{
-    DataPhase, TransferExtras, TransferType, UsbError,
-};
+use cotton_usb_host::host_controller::{DataPhase, TransferExtras, TransferType, UsbError};
 use cotton_usb_host::wire::SetupPacket;
 
 use super::controller::Imxrt1062HostController;
 use super::futures::TransferComplete;
 use super::interrupt_pipe::{Imxrt1062InterruptPipe, Pipe};
-use super::{NUM_QH};
+use super::NUM_QH;
 
 impl Imxrt1062HostController {
     // -----------------------------------------------------------------------
@@ -192,11 +190,11 @@ impl Imxrt1062HostController {
         // Build QH characteristics
         let characteristics = ehci::qh_characteristics(
             address,
-            0,              // endpoint 0 (control)
+            0, // endpoint 0 (control)
             speed,
             packet_size as u16,
-            true,           // is_control
-            false,          // not head of reclamation
+            true,  // is_control
+            false, // not head of reclamation
         );
 
         // Build QH capabilities.
@@ -218,8 +216,10 @@ impl Imxrt1062HostController {
             TransferExtras::WithPreamble => "WithPreamble(LS)",
             TransferExtras::Normal => "Normal",
         };
-        debug!("[HC] control xfer: addr={} pkt={} speed={} extras={} char=0x{:08X} caps=0x{:08X}",
-            address, packet_size, speed_str, extras_str, characteristics, capabilities);
+        debug!(
+            "[HC] control xfer: addr={} pkt={} speed={} extras={} char=0x{:08X} caps=0x{:08X}",
+            address, packet_size, speed_str, extras_str, characteristics, capabilities
+        );
 
         // Initialise the QH
         // SAFETY: `qh` is a valid pool pointer (see qh_mut call above).
@@ -272,18 +272,16 @@ impl Imxrt1062HostController {
                     buf.len()
                 };
                 let data_qtd = data_slot.as_ref().unwrap().ptr();
-                let data_token =
-                    ehci::qtd_token(PID_IN, data_len as u32, true, false);
+                let data_token = ehci::qtd_token(PID_IN, data_len as u32, true, false);
                 // SAFETY: data qTD pointer from QtdSlot; buffer from caller (DMA-accessible).
                 unsafe {
                     (*data_qtd).init(data_token, buf.as_ptr(), data_len as u32);
                 }
             }
-            DataPhase::Out(ref buf) => {
+            DataPhase::Out(buf) => {
                 data_len = buf.len();
                 let data_qtd = data_slot.as_ref().unwrap().ptr();
-                let data_token =
-                    ehci::qtd_token(PID_OUT, data_len as u32, true, false);
+                let data_token = ehci::qtd_token(PID_OUT, data_len as u32, true, false);
                 // SAFETY: data qTD pointer from QtdSlot; buffer from caller (DMA-accessible).
                 unsafe {
                     (*data_qtd).init(data_token, buf.as_ptr(), data_len as u32);
@@ -316,11 +314,9 @@ impl Imxrt1062HostController {
                     (*data_qtd).next.write(status_qtd as u32);
                 }
             }
-            None => {
-                unsafe {
-                    (*setup_qtd).next.write(status_qtd as u32);
-                }
-            }
+            None => unsafe {
+                (*setup_qtd).next.write(status_qtd as u32);
+            },
         }
 
         // Attach the first qTD to the QH
@@ -334,7 +330,7 @@ impl Imxrt1062HostController {
         Self::cache_clean_buffer(setup_bytes, 8);
 
         // Clean outgoing data buffer if applicable
-        if let DataPhase::Out(ref buf) = data_phase {
+        if let DataPhase::Out(buf) = data_phase {
             Self::cache_clean_buffer(buf.as_ptr(), buf.len());
         }
 
@@ -391,7 +387,7 @@ impl Imxrt1062HostController {
                             Ok(0)
                         }
                     }
-                    DataPhase::Out(ref buf) => Ok(buf.len()),
+                    DataPhase::Out(buf) => Ok(buf.len()),
                     DataPhase::None => Ok(0),
                 }
             }
@@ -402,11 +398,14 @@ impl Imxrt1062HostController {
                 Self::cache_clean_qtd(setup_qtd);
                 let setup_token_val = unsafe { (*setup_qtd).token.read() };
                 let status_token_val = unsafe { (*status_qtd).token.read() };
-                let data_token_val = data_slot.as_ref().map(|s| {
-                    let p = s.ptr();
-                    Self::cache_clean_qtd(p);
-                    unsafe { (*p).token.read() }
-                }).unwrap_or(0);
+                let data_token_val = data_slot
+                    .as_ref()
+                    .map(|s| {
+                        let p = s.ptr();
+                        Self::cache_clean_qtd(p);
+                        unsafe { (*p).token.read() }
+                    })
+                    .unwrap_or(0);
                 let portsc = ral::read_reg!(ral::usb, self.usb, PORTSC1);
                 debug!("[HC] control xfer FAILED: err={} setup_tok=0x{:08X} data_tok=0x{:08X} status_tok=0x{:08X} PORTSC1=0x{:08X}",
                     Self::usb_error_str(&e),
@@ -559,8 +558,8 @@ impl Imxrt1062HostController {
             usb: &self.usb,
             shared: self.shared,
             statics: self.statics,
-            status_qtd_index: if zlp_slot.is_some() {
-                zlp_slot.as_ref().unwrap().index()
+            status_qtd_index: if let Some(ref zlp) = zlp_slot {
+                zlp.index()
             } else {
                 data_slot.index()
             },
@@ -660,7 +659,9 @@ impl Imxrt1062HostController {
 
         // Allocate a qTD for the receive buffer.
         // We use a dedicated qTD for the lifetime of the pipe (one in-flight at a time).
-        let qtd_slot = self.alloc_qtd().expect("qTD pool exhausted for interrupt pipe");
+        let qtd_slot = self
+            .alloc_qtd()
+            .expect("qTD pool exhausted for interrupt pipe");
         let qtd_index = qtd_slot.index();
 
         // Determine device speed.
@@ -708,8 +709,7 @@ impl Imxrt1062HostController {
         // If address is 0x2000_xxxx (DTCM), EHCI DMA cannot write there → always zeros.
         debug!(
             "[HC] recv_buf[{}] @ 0x{:08x} (OCRAM=0x2020_0000..0x202F_FFFF, DTCM=0x2000_xxxx)",
-            recv_buf_idx,
-            recv_buf_ptr as u32,
+            recv_buf_idx, recv_buf_ptr as u32,
         );
         let token = ehci::qtd_token(PID_IN, max_packet_size as u32, false, true);
         let qtd = qtd_slot.ptr();
