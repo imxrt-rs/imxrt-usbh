@@ -1,4 +1,4 @@
-//! `Imxrt1062HostController` struct definition, construction, and initialization.
+//! `ImxrtHostController` struct definition, construction, and initialization.
 
 use crate::ral;
 
@@ -6,7 +6,7 @@ use super::shared::UsbShared;
 use super::statics::UsbStatics;
 
 // ---------------------------------------------------------------------------
-// Imxrt1062HostController
+// ImxrtHostController
 // ---------------------------------------------------------------------------
 
 /// USB host controller for i.MX RT 1062.
@@ -38,7 +38,7 @@ use super::statics::UsbStatics;
 /// # Construction
 ///
 /// ```ignore
-/// use imxrt_usbh::host::{Imxrt1062HostController, UsbShared, UsbStatics};
+/// use imxrt_usbh::host::{ImxrtHostController, UsbShared, UsbStatics};
 ///
 /// static SHARED: UsbShared = UsbShared::new();
 /// static STATICS: StaticCell<UsbStatics> = StaticCell::new();
@@ -46,9 +46,9 @@ use super::statics::UsbStatics;
 /// let statics = STATICS.init(UsbStatics::new());
 /// let usb = unsafe { imxrt_ral::usb::USB2::instance() };
 /// let usbphy = unsafe { imxrt_ral::usbphy::USBPHY2::instance() };
-/// let host = Imxrt1062HostController::new(usb, usbphy, &SHARED, statics);
+/// let host = ImxrtHostController::new(usb, usbphy, &SHARED, statics);
 /// ```
-pub struct Imxrt1062HostController {
+pub struct ImxrtHostController {
     /// USB OTG core registers (owned).
     pub(super) usb: ral::usb::Instance,
 
@@ -62,14 +62,14 @@ pub struct Imxrt1062HostController {
     pub(super) statics: &'static UsbStatics,
 }
 
-// Safety: Imxrt1062HostController is designed for single-task usage.
+// Safety: ImxrtHostController is designed for single-task usage.
 // The raw pointer in ral::usb::Instance is stable (points to MMIO registers).
 // &'static UsbStatics is safe to send because UsbStatics lives in a static and
 // is only accessed from async task context (never from ISR).
 // &'static UsbShared uses CriticalSection-based synchronization.
-unsafe impl Send for Imxrt1062HostController {}
+unsafe impl Send for ImxrtHostController {}
 
-impl Imxrt1062HostController {
+impl ImxrtHostController {
     /// Create a new host controller from `imxrt-ral` register instances and
     /// static resources.
     ///
@@ -196,7 +196,7 @@ impl Imxrt1062HostController {
         // ---- Step 2: Reset USB controller ----
         //
         // Assert controller reset. RST is self-clearing.
-        ral::modify_reg!(ral::usb, self.usb, USBCMD, |cmd| cmd | (1 << 1));
+        ral::modify_reg!(ral::usb, self.usb, USBCMD, RST: 1);
 
         // Spin until the controller completes reset (RST self-clears to 0).
         while ral::read_reg!(ral::usb, self.usb, USBCMD, RST == 1) {}
@@ -266,14 +266,15 @@ impl Imxrt1062HostController {
         // Note: ASE (async schedule enable) is NOT set here. It will be enabled
         // when the first endpoint pipe is added in phase 2, because running the
         // async schedule with only a sentinel QH wastes bus bandwidth.
-        let usbcmd: u32 = (1 << 0)    // RS: Run
-            | (0b01 << 2)             // FS_1: frame list size low bits
-            | (1 << 4)               // PSE: periodic schedule enable
-            | (0b11 << 8)            // ASP: async park count = 3
-            | (1 << 11)              // ASPE: async park mode enable
-            | (1 << 15)              // FS_2: frame list size high bit
-            | (1 << 16); // ITC: 1 micro-frame threshold
-        ral::write_reg!(ral::usb, self.usb, USBCMD, usbcmd);
+        ral::write_reg!(ral::usb, self.usb, USBCMD,
+            RS: 1,          // Run
+            FS_1: 0b01,     // Frame list size low bits (32 entries)
+            PSE: 1,         // Periodic schedule enable
+            ASP: 0b11,      // Async park count = 3
+            ASPE: 1,        // Async park mode enable
+            FS_2: 1,        // Frame list size high bit (32 entries)
+            ITC: 1          // 1 micro-frame interrupt threshold
+        );
 
         // ---- Step 9: Enable port power ----
         //
@@ -292,9 +293,9 @@ impl Imxrt1062HostController {
         // allowing High Speed (480 Mbps) devices to negotiate at full speed.
         let portsc = self.portsc1_read_safe();
         #[cfg(feature = "hub-support")]
-        let portsc_val = portsc | (1 << 12) | (1 << 24); // PP=1, PFSC=1
+        let portsc_val = portsc | ral::usb::PORTSC1::PP::mask | ral::usb::PORTSC1::PFSC::mask;
         #[cfg(not(feature = "hub-support"))]
-        let portsc_val = portsc | (1 << 12); // PP=1 only
+        let portsc_val = portsc | ral::usb::PORTSC1::PP::mask;
         ral::write_reg!(ral::usb, self.usb, PORTSC1, portsc_val);
 
         // ---- Step 10: High-speed disconnect detection ----
@@ -304,7 +305,7 @@ impl Imxrt1062HostController {
         // and interfere with FS→HS chirp negotiation during port reset.
         // Per USBHost_t36 (ehci.cpp:405): set only after HSP=1 in PORTSC1.
         //
-        // This is handled in Imxrt1062DeviceDetect::poll_next():
+        // This is handled in ImxrtDeviceDetect::poll_next():
         //   - Set ENHOSTDISCONDETECT when device_status is Present(High480)
         //   - Clear ENHOSTDISCONDETECT on disconnect or FS/LS connection
 
@@ -351,10 +352,8 @@ impl Imxrt1062HostController {
     /// Convert the PORTSC1 PSPD field to a `DeviceStatus`.
     #[allow(dead_code)]
     pub(super) fn device_status(&self) -> cotton_usb_host::host_controller::DeviceStatus {
-        let portsc = ral::read_reg!(ral::usb, self.usb, PORTSC1);
-        let connected = (portsc & 1) != 0; // CCS bit 0
-        if connected {
-            let pspd = (portsc >> 26) & 0x3;
+        let (connected, pspd) = ral::read_reg!(ral::usb, self.usb, PORTSC1, CCS, PSPD);
+        if connected != 0 {
             let speed = match pspd {
                 0 => cotton_usb_host::host_controller::UsbSpeed::Full12,
                 1 => cotton_usb_host::host_controller::UsbSpeed::Low1_5,
@@ -371,36 +370,27 @@ impl Imxrt1062HostController {
     // Re-enable port change interrupt
     // -----------------------------------------------------------------------
 
-    /// Re-enable the port change interrupt (PCE, bit 2) in USBINTR.
+    /// Re-enable the port change interrupt (PCE) in USBINTR.
     ///
     /// Called from poll functions after checking device status, following
     /// the disable-on-handle / re-enable-on-poll pattern.
     #[allow(dead_code)]
     pub(super) fn reenable_port_change_interrupt(&self) {
-        ral::modify_reg!(ral::usb, self.usb, USBINTR, |v| v | (1 << 2));
+        ral::modify_reg!(ral::usb, self.usb, USBINTR, PCE: 1);
     }
 
     /// Re-enable transfer completion interrupts in USBINTR.
     ///
-    /// Re-enables: UE (bit 0), UEE (bit 1), UAIE (bit 18), UPIE (bit 19).
+    /// Re-enables: UE, UEE, UAIE, UPIE.
     #[allow(dead_code)]
     pub(super) fn reenable_transfer_interrupts(&self) {
-        ral::modify_reg!(
-            ral::usb,
-            self.usb,
-            USBINTR,
-            |v| v
-            | (1 << 0)   // UE
-            | (1 << 1)   // UEE
-            | (1 << 18)  // UAIE
-            | (1 << 19) // UPIE
-        );
+        ral::modify_reg!(ral::usb, self.usb, USBINTR, UE: 1, UEE: 1, UAIE: 1, UPIE: 1);
     }
 
-    /// Re-enable the async advance interrupt (AAE, bit 5) in USBINTR.
+    /// Re-enable the async advance interrupt (AAE) in USBINTR.
     #[allow(dead_code)]
     pub(super) fn reenable_async_advance_interrupt(&self) {
-        ral::modify_reg!(ral::usb, self.usb, USBINTR, |v| v | (1 << 5));
+        ral::modify_reg!(ral::usb, self.usb, USBINTR, AAE: 1);
     }
 
     // -----------------------------------------------------------------------
@@ -411,11 +401,14 @@ impl Imxrt1062HostController {
     ///
     /// When doing a read-modify-write on PORTSC1, these bits must be masked
     /// off to avoid accidentally clearing them. Per EHCI spec, W1C bits:
-    /// - CSC (bit 1) — Connect Status Change
-    /// - PEC (bit 3) — Port Enable/Disable Change  (not in NXP, but safe)
-    /// - OCC (bit 5) — Over-current Change
-    /// - FPR (bit 6) — Force Port Resume (read as 0 when not suspended)
-    pub(super) const PORTSC1_W1C_MASK: u32 = (1 << 1) | (1 << 3) | (1 << 5) | (1 << 6);
+    /// - CSC — Connect Status Change
+    /// - PEC — Port Enable/Disable Change
+    /// - OCC — Over-current Change
+    /// - FPR — Force Port Resume (read as 0 when not suspended)
+    pub(super) const PORTSC1_W1C_MASK: u32 = ral::usb::PORTSC1::CSC::mask
+        | ral::usb::PORTSC1::PEC::mask
+        | ral::usb::PORTSC1::OCC::mask
+        | ral::usb::PORTSC1::FPR::mask;
 
     /// Read PORTSC1 with W1C bits cleared to prevent accidental clear.
     ///

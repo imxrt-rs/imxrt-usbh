@@ -72,36 +72,38 @@ impl UsbShared {
         // Read which interrupts fired
         let status = ral::read_reg!(ral::usb, usb, USBSTS);
 
-        // Acknowledge pending status bits (W1C), but NOT AAI (bit 5).
+        // Acknowledge pending status bits (W1C), but NOT AAI.
         // AsyncAdvanceWait::poll() reads USBSTS.AAI directly to detect
         // completion — if we cleared it here, the poll function would
         // miss it and hang forever.
-        ral::write_reg!(ral::usb, usb, USBSTS, status & !(1 << 5));
+        ral::write_reg!(ral::usb, usb, USBSTS, status & !ral::usb::USBSTS::AAI::mask);
 
         // Port Change Interrupt — wake the device-detect stream
-        if status & (1 << 2) != 0 {
+        if status & ral::usb::USBSTS::PCI::mask != 0 {
             self.device_waker.wake();
         }
 
-        // USB Interrupt (USBINT, bit 0) — async/periodic transfer completion.
-        // USB Error Interrupt (USBERRINT, bit 1) — transfer error.
+        // USB Interrupt (UI) — async/periodic transfer completion.
+        // USB Error Interrupt (UEI) — transfer error.
         // On the i.MX RT (NXP/ChipIdea), bits 18 (UAI) and 19 (UPI) provide
         // finer-grained async vs periodic completion, but we also check the
-        // standard USBINT bit for compatibility.
-        if status & ((1 << 0) | (1 << 1) | (1 << 18) | (1 << 19)) != 0 {
+        // standard UI bit for compatibility.
+        // Note: UAI/UPI are NXP extensions not defined in the RAL USBSTS module.
+        const NXP_UAI: u32 = 1 << 18;
+        const NXP_UPI: u32 = 1 << 19;
+        if status & (ral::usb::USBSTS::UI::mask | ral::usb::USBSTS::UEI::mask | NXP_UAI | NXP_UPI)
+            != 0
+        {
             // Wake all pipe wakers — the poll functions will check their
             // individual QH/qTD status to determine which pipe completed.
-            //
-            // TODO(phase 2): Use a per-pipe completion bitmap to wake only
-            // the relevant pipe waker, avoiding unnecessary wakeups.
             for waker in &self.pipe_wakers {
                 waker.wake();
             }
         }
 
-        // Async Advance Interrupt (bit 5) — doorbell acknowledged,
+        // Async Advance Interrupt — doorbell acknowledged,
         // safe to free unlinked QHs.
-        if status & (1 << 5) != 0 {
+        if status & ral::usb::USBSTS::AAI::mask != 0 {
             self.async_advance_waker.wake();
         }
 

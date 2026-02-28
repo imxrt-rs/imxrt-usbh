@@ -42,7 +42,7 @@ and manage USB hubs. The stack is layered as follows:
 ├─────────────────────────────────────────────────┤
 │     HostController trait                        │  (abstraction boundary)
 ├─────────────────────────────────────────────────┤
-│  Imxrt1062HostController      (this crate)      │
+│  ImxrtHostController      (this crate)      │
 │  UsbShared (ISR ↔ async task)                   │
 │  UsbStatics (pipe/QH/qTD pools)                 │
 │  Cache coherency layer                          │
@@ -59,7 +59,7 @@ implementation in cotton-usb-host:
   Contains waker registrations. Lives in a `static`.
 - **`UsbStatics`** — Static-lifetime resource pools for QHs, qTDs, pipe slots, and
   receive buffers. Not accessed by the ISR. Lives in a `ConstStaticCell`.
-- **`Imxrt1062HostController`** — The main driver. Owns the USB register block
+- **`ImxrtHostController`** — The main driver. Owns the USB register block
   instances and references to `UsbShared` and `UsbStatics`.
 
 ### Key Dependencies
@@ -91,14 +91,14 @@ src/
     ├── mod.rs           — Module declarations, re-exports, pool sizing constants
     ├── shared.rs        — UsbShared: ISR↔async bridge, on_irq(), wakers
     ├── statics.rs       — UsbStatics, RecvBuf: resource pools and DMA buffers
-    ├── controller.rs    — Imxrt1062HostController: struct, new(), init(), port helpers
+    ├── controller.rs    — ImxrtHostController: struct, new(), init(), port helpers
     ├── schedule.rs      — QH/qTD allocation (QtdSlot RAII), async/periodic schedule management
     ├── transfer.rs      — do_control_transfer, do_bulk_transfer, do_alloc_interrupt_pipe,
     │                      cache wrappers, periodic chain diagnostics
     ├── futures.rs       — TransferComplete future, AsyncAdvanceWait future
-    ├── device_detect.rs — Imxrt1062DeviceDetect: Stream<Item = DeviceStatus>
-    ├── interrupt_pipe.rs — Imxrt1062InterruptPipe: Stream<Item = InterruptPacket>, with Drop cleanup
-    └── trait_impl.rs    — impl HostController for Imxrt1062HostController
+    ├── device_detect.rs — ImxrtDeviceDetect: Stream<Item = DeviceStatus>
+    ├── interrupt_pipe.rs — ImxrtInterruptPipe: Stream<Item = InterruptPacket>, with Drop cleanup
+    └── trait_impl.rs    — impl HostController for ImxrtHostController
 ```
 
 ### Pool Sizing Constants (host/mod.rs)
@@ -231,7 +231,7 @@ Similar to control, but:
 2. **Configure QH**: Set endpoint characteristics, S-mask / C-mask for periodic
    scheduling based on the requested interval.
 3. **Link QH** to the periodic schedule frame list.
-4. **Return** an `Imxrt1062InterruptPipe` stream.
+4. **Return** an `ImxrtInterruptPipe` stream.
 
 The stream's `poll_next()` checks the qTD's token. On completion, it copies
 received data into an `InterruptPacket`, re-arms the qTD (preserving the data
@@ -398,7 +398,7 @@ GPIO8_DR_SET = 1 << 26;
 
 ### Clock Prerequisites (Caller Responsibility)
 
-Before calling `Imxrt1062HostController::init()`:
+Before calling `ImxrtHostController::init()`:
 
 1. **USB2 PLL**: Set `CCM_ANALOG_PLL_USB2` — enable, set power, wait for lock.
 2. **Clock gate**: Enable USB OTG2 in `CCM_CCGR6`.

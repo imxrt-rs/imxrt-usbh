@@ -7,7 +7,7 @@ use core::task::{Context, Poll};
 use cotton_usb_host::host_controller::InterruptPacket;
 use futures_core::Stream;
 
-use super::controller::Imxrt1062HostController;
+use super::controller::ImxrtHostController;
 use super::schedule::QtdSlot;
 use super::shared::UsbShared;
 use super::statics::UsbStatics;
@@ -39,7 +39,7 @@ impl Pipe {
 }
 
 // ---------------------------------------------------------------------------
-// Imxrt1062InterruptPipe — periodic schedule interrupt endpoint stream
+// ImxrtInterruptPipe — periodic schedule interrupt endpoint stream
 // ---------------------------------------------------------------------------
 
 /// Interrupt IN pipe for i.MX RT 1062.
@@ -50,14 +50,14 @@ impl Pipe {
 ///
 /// # Lifecycle
 ///
-/// Created by `Imxrt1062HostController::alloc_interrupt_pipe` or
+/// Created by `ImxrtHostController::alloc_interrupt_pipe` or
 /// `try_alloc_interrupt_pipe`. The pipe occupies one slot from the
 /// `bulk_pipes` pool and one slot from the `qtd_pool` for its entire lifetime.
 ///
 /// On `Drop`, the QH is unlinked from the periodic frame list and the qTD
 /// slot is freed. A brief (~1 ms) busy-wait ensures the EHCI controller has
 /// crossed at least one frame boundary before resources are released.
-pub struct Imxrt1062InterruptPipe {
+pub struct ImxrtInterruptPipe {
     /// Pool allocation (RAII — frees the `bulk_pipes` slot on Drop).
     pub(super) pipe: Pipe,
     /// Index into `statics.qh_pool` for this pipe's QH.
@@ -82,7 +82,7 @@ pub struct Imxrt1062InterruptPipe {
     pub(super) usb_base: u32,
 }
 
-impl Stream for Imxrt1062InterruptPipe {
+impl Stream for ImxrtInterruptPipe {
     type Item = InterruptPacket;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -98,7 +98,7 @@ impl Stream for Imxrt1062InterruptPipe {
 
         // Invalidate cache to see any hardware updates to the qTD token.
         let qtd_ptr = self.qtd_slot.ptr();
-        Imxrt1062HostController::cache_clean_qtd(qtd_ptr);
+        ImxrtHostController::cache_clean_qtd(qtd_ptr);
 
         // SAFETY: qTD pointer from QtdSlot::ptr() — valid, aligned static pool
         // entry exclusively owned by this pipe.  Cache was just invalidated above.
@@ -106,16 +106,7 @@ impl Stream for Imxrt1062InterruptPipe {
 
         if token & ehci::QTD_TOKEN_ACTIVE != 0 {
             // Transfer still in progress — re-enable transfer interrupts and wait.
-            ral::modify_reg!(
-                ral::usb,
-                usb_inst,
-                USBINTR,
-                |v| v
-                | (1 << 0)   // UE
-                | (1 << 1)   // UEE
-                | (1 << 18)  // UAIE
-                | (1 << 19) // UPIE
-            );
+            ral::modify_reg!(ral::usb, usb_inst, USBINTR, UE: 1, UEE: 1, UAIE: 1, UPIE: 1);
             return Poll::Pending;
         }
 
@@ -131,7 +122,7 @@ impl Stream for Imxrt1062InterruptPipe {
                 token,
             );
             // Re-enable port change interrupt so DeviceDetect can fire.
-            ral::modify_reg!(ral::usb, usb_inst, USBINTR, |v| v | (1 << 2));
+            ral::modify_reg!(ral::usb, usb_inst, USBINTR, PCE: 1);
             return Poll::Ready(None);
         }
 
@@ -191,26 +182,17 @@ impl Stream for Imxrt1062InterruptPipe {
         }
 
         // Flush both the qTD and QH back to RAM for the DMA engine.
-        Imxrt1062HostController::cache_clean_qtd(rearm_qtd);
-        Imxrt1062HostController::cache_clean_qh(qh_ptr);
+        ImxrtHostController::cache_clean_qtd(rearm_qtd);
+        ImxrtHostController::cache_clean_qh(qh_ptr);
 
         // Re-enable transfer interrupts so the next completion wakes us.
-        ral::modify_reg!(
-            ral::usb,
-            usb_inst,
-            USBINTR,
-            |v| v
-            | (1 << 0)   // UE
-            | (1 << 1)   // UEE
-            | (1 << 18)  // UAIE
-            | (1 << 19) // UPIE
-        );
+        ral::modify_reg!(ral::usb, usb_inst, USBINTR, UE: 1, UEE: 1, UAIE: 1, UPIE: 1);
 
         Poll::Ready(Some(packet))
     }
 }
 
-impl Drop for Imxrt1062InterruptPipe {
+impl Drop for ImxrtInterruptPipe {
     fn drop(&mut self) {
         // 1. Remove the QH from the periodic frame list.
         let qh_ptr = self.statics.qh_ptr(self.qh_index);
@@ -218,7 +200,7 @@ impl Drop for Imxrt1062InterruptPipe {
         // removes all references to this QH from the frame list and any
         // predecessor QH's horizontal_link.
         unsafe {
-            Imxrt1062HostController::unlink_qh_from_periodic_schedule(self.statics, qh_ptr);
+            ImxrtHostController::unlink_qh_from_periodic_schedule(self.statics, qh_ptr);
         }
 
         // Clean the frame list after modification.
@@ -228,7 +210,7 @@ impl Drop for Imxrt1062InterruptPipe {
         );
         // Clean any predecessor QHs whose horizontal_link we may have changed.
         for i in 2..=NUM_QH {
-            Imxrt1062HostController::cache_clean_qh(self.statics.qh_ptr(i));
+            ImxrtHostController::cache_clean_qh(self.statics.qh_ptr(i));
         }
 
         // 2. Wait ≥1 ms for the controller to cross a frame boundary.
@@ -237,8 +219,13 @@ impl Drop for Imxrt1062InterruptPipe {
         // to this QH for the current frame. A ~1 ms busy-wait (one EHCI frame
         // at full speed = 1 ms) ensures no further DMA accesses will occur
         // before we release the memory.
+        //
+        // Note: cortex_m::asm::delay may complete in half the expected time
+        // on Cortex-M7 due to the dual-issue pipeline, so we use 2× the
+        // nominal cycle count to ensure we meet the minimum delay.
+        // See: https://github.com/rust-embedded/cortex-m/issues/430
         #[cfg(target_os = "none")]
-        cortex_m::asm::delay(600_000); // 1 ms at 600 MHz
+        cortex_m::asm::delay(1_200_000); // ≥1 ms at 600 MHz (2× for Cortex-M7)
 
         // 3. qTD cleanup is handled automatically by QtdSlot::drop() when
         //    `self.qtd_slot` is dropped after this Drop body finishes.

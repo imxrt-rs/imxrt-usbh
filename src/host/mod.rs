@@ -4,7 +4,7 @@
 //!
 //! - [`UsbShared`](crate::host::UsbShared) — interrupt-safe state shared between ISR and async tasks.
 //! - [`UsbStatics`](crate::host::UsbStatics) — static-lifetime resource pools (not shared with ISR).
-//! - [`Imxrt1062HostController`](crate::host::Imxrt1062HostController) — the main controller implementing
+//! - [`ImxrtHostController`](crate::host::ImxrtHostController) — the main controller implementing
 //!   [`HostController`](crate::host_controller::HostController).
 //!
 //! # Architecture
@@ -15,7 +15,7 @@
 //! ```text
 //!   static UsbShared      <---- ISR calls on_irq(), wakes pipe/device wakers
 //!   static UsbStatics     <---- Pool-based pipe allocation (not ISR-accessed)
-//!   Imxrt1062HostController --> owns register blocks, references shared/statics
+//!   ImxrtHostController --> owns register blocks, references shared/statics
 //! ```
 //!
 //! Both `UsbShared` and `UsbStatics` are `const`-constructible and designed to
@@ -53,9 +53,9 @@ mod transfer;
 // Re-exports (public API)
 // ---------------------------------------------------------------------------
 
-pub use controller::Imxrt1062HostController;
-pub use device_detect::Imxrt1062DeviceDetect;
-pub use interrupt_pipe::Imxrt1062InterruptPipe;
+pub use controller::ImxrtHostController;
+pub use device_detect::ImxrtDeviceDetect;
+pub use interrupt_pipe::ImxrtInterruptPipe;
 pub use shared::UsbShared;
 pub use statics::{RecvBuf, UsbStatics};
 

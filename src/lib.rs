@@ -6,7 +6,7 @@
 //!
 //! # Getting started
 //!
-//! Create an [`Imxrt1062HostController`](crate::host::Imxrt1062HostController)
+//! Create an [`ImxrtHostController`](crate::host::ImxrtHostController)
 //! by passing `imxrt-ral` USB and USBPHY register instances along with static
 //! resource pools. See the controller documentation for details.
 //!
@@ -48,7 +48,7 @@ pub mod ehci;
 
 /// USB host controller driver and supporting types.
 ///
-/// Start here: [`Imxrt1062HostController`](crate::host::Imxrt1062HostController) is
+/// Start here: [`ImxrtHostController`](crate::host::ImxrtHostController) is
 /// the main driver. [`UsbShared`](crate::host::UsbShared) and
 /// [`UsbStatics`](crate::host::UsbStatics) provide the static resources it needs.
 pub mod host;
