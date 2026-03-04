@@ -6,7 +6,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use super::controller::Imxrt1062HostController;
+use super::controller::ImxrtHostController;
 use super::shared::UsbShared;
 use super::statics::UsbStatics;
 
@@ -50,11 +50,11 @@ impl Future for TransferComplete<'_> {
         let qh_ptr = self.statics.qh_ptr(self.qh_index);
 
         // Invalidate cache to see hardware updates
-        Imxrt1062HostController::cache_clean_qtd(status_qtd_ptr);
+        ImxrtHostController::cache_clean_qtd(status_qtd_ptr);
         if let Some(dp) = data_qtd_ptr {
-            Imxrt1062HostController::cache_clean_qtd(dp);
+            ImxrtHostController::cache_clean_qtd(dp);
         }
-        Imxrt1062HostController::cache_clean_qh(qh_ptr);
+        ImxrtHostController::cache_clean_qh(qh_ptr);
 
         // SAFETY: All pointers derived from UsbStatics pool via qtd_ptr()/qh_ptr()
         // (valid, aligned, `'static` lifetime).  Cache was just invalidated above
@@ -81,7 +81,7 @@ impl Future for TransferComplete<'_> {
                     "[HC] TransferComplete: QH overlay halted (overlay=0x{:08x}), aborting",
                     overlay
                 );
-                return Poll::Ready(Err(Imxrt1062HostController::map_qtd_error(overlay)));
+                return Poll::Ready(Err(ImxrtHostController::map_qtd_error(overlay)));
             }
 
             // Also check if data qTD has errored (early exit)
@@ -90,27 +90,18 @@ impl Future for TransferComplete<'_> {
                 let data_token = unsafe { (*dp).token.read() };
                 if data_token & QTD_TOKEN_HALTED != 0 {
                     // Data phase halted — map error
-                    return Poll::Ready(Err(Imxrt1062HostController::map_qtd_error(data_token)));
+                    return Poll::Ready(Err(ImxrtHostController::map_qtd_error(data_token)));
                 }
             }
 
             // Re-enable transfer completion interrupts
-            ral::modify_reg!(
-                ral::usb,
-                self.usb,
-                USBINTR,
-                |v| v
-                | (1 << 0)   // UE
-                | (1 << 1)   // UEE
-                | (1 << 18)  // UAIE
-                | (1 << 19) // UPIE
-            );
+            ral::modify_reg!(ral::usb, self.usb, USBINTR, UE: 1, UEE: 1, UAIE: 1, UPIE: 1);
             return Poll::Pending;
         }
 
         // Transfer complete — check for errors
         if token & ehci::QTD_TOKEN_ERROR_MASK != 0 {
-            return Poll::Ready(Err(Imxrt1062HostController::map_qtd_error(token)));
+            return Poll::Ready(Err(ImxrtHostController::map_qtd_error(token)));
         }
 
         // Also check the data qTD if present
@@ -118,7 +109,7 @@ impl Future for TransferComplete<'_> {
             // SAFETY: data qTD pointer from statics pool, cache invalidated above.
             let data_token = unsafe { (*dp).token.read() };
             if data_token & ehci::QTD_TOKEN_ERROR_MASK != 0 {
-                return Poll::Ready(Err(Imxrt1062HostController::map_qtd_error(data_token)));
+                return Poll::Ready(Err(ImxrtHostController::map_qtd_error(data_token)));
             }
         }
 
@@ -145,16 +136,15 @@ impl Future for AsyncAdvanceWait<'_> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.shared.async_advance_waker().register(cx.waker());
 
-        // Check if AAI (bit 5) is already set in USBSTS
-        let status = ral::read_reg!(ral::usb, self.usb, USBSTS);
-        if status & (1 << 5) != 0 {
+        // Check if AAI is already set in USBSTS
+        if ral::read_reg!(ral::usb, self.usb, USBSTS, AAI == 1) {
             // Clear it (W1C)
-            ral::write_reg!(ral::usb, self.usb, USBSTS, 1 << 5);
+            ral::write_reg!(ral::usb, self.usb, USBSTS, AAI: 1);
             return Poll::Ready(());
         }
 
         // Re-enable AAE interrupt
-        ral::modify_reg!(ral::usb, self.usb, USBINTR, |v| v | (1 << 5));
+        ral::modify_reg!(ral::usb, self.usb, USBINTR, AAE: 1);
         Poll::Pending
     }
 }

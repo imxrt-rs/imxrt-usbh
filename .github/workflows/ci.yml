@@ -15,9 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - run: rustup component add rustfmt
       - run: cargo fmt --check
 
   clippy:
@@ -28,10 +26,8 @@ jobs:
         chip: [imxrt1062]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-          targets: thumbv7em-none-eabihf
+      - run: rustup component add clippy
+      - run: rustup target add thumbv7em-none-eabihf
       - run: cargo clippy --features=imxrt-ral/${{ matrix.chip }} --target=thumbv7em-none-eabihf -- -D warnings
 
   build:
@@ -47,9 +43,7 @@ jobs:
           - imxrt1176_cm7
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: thumbv7em-none-eabihf
+      - run: rustup target add thumbv7em-none-eabihf
       - run: cargo build --features=imxrt-ral/${{ matrix.chip }} --target=thumbv7em-none-eabihf
 
   test:
@@ -57,5 +51,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --features=imxrt-ral/imxrt1062 --lib
