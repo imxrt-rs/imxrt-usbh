@@ -8,7 +8,7 @@ use futures_core::Stream;
 use rtic_common::waker_registration::CriticalSectionWakerRegistration;
 
 // ---------------------------------------------------------------------------
-// Imxrt1062DeviceDetect — Stream<Item = DeviceStatus>
+// ImxrtDeviceDetect — Stream<Item = DeviceStatus>
 // ---------------------------------------------------------------------------
 
 /// Device detection stream for the i.MX RT 1062 USB host controller.
@@ -20,7 +20,7 @@ use rtic_common::waker_registration::CriticalSectionWakerRegistration;
 /// Follows the RP2040 pattern: stores the previous status and only returns
 /// `Ready` when the status changes.
 #[derive(Copy, Clone)]
-pub struct Imxrt1062DeviceDetect {
+pub struct ImxrtDeviceDetect {
     /// USB OTG register block base address (stored as `u32` to keep the struct
     /// `Send` without a manual `unsafe impl`).
     usb_base: u32,
@@ -30,7 +30,7 @@ pub struct Imxrt1062DeviceDetect {
     status: DeviceStatus,
 }
 
-impl Imxrt1062DeviceDetect {
+impl ImxrtDeviceDetect {
     pub(super) fn new(
         usb: &ral::usb::Instance,
         usbphy: &ral::usbphy::Instance,
@@ -61,10 +61,8 @@ impl Imxrt1062DeviceDetect {
     /// Read the current device status from PORTSC1.
     fn read_device_status(&self) -> DeviceStatus {
         let usb = self.usb_instance();
-        let portsc = ral::read_reg!(ral::usb, usb, PORTSC1);
-        let connected = (portsc & 1) != 0; // CCS bit 0
-        if connected {
-            let pspd = (portsc >> 26) & 0x3;
+        let (connected, pspd) = ral::read_reg!(ral::usb, usb, PORTSC1, CCS, PSPD);
+        if connected != 0 {
             match pspd {
                 0 => DeviceStatus::Present(UsbSpeed::Full12),
                 1 => DeviceStatus::Present(UsbSpeed::Low1_5),
@@ -79,7 +77,7 @@ impl Imxrt1062DeviceDetect {
     /// Re-enable the port change interrupt.
     fn reenable_interrupt(&self) {
         let usb = self.usb_instance();
-        ral::modify_reg!(ral::usb, usb, USBINTR, |v| v | (1 << 2));
+        ral::modify_reg!(ral::usb, usb, USBINTR, PCE: 1);
     }
 
     /// Set ENHOSTDISCONDETECT in the USBPHY CTRL register.
@@ -101,7 +99,7 @@ impl Imxrt1062DeviceDetect {
     }
 }
 
-impl Stream for Imxrt1062DeviceDetect {
+impl Stream for ImxrtDeviceDetect {
     type Item = DeviceStatus;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {

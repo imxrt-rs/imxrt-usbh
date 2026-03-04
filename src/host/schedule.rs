@@ -8,7 +8,7 @@
 use crate::ehci::{self, link_pointer, link_type, QueueHead, TransferDescriptor, LINK_TERMINATE};
 use crate::ral;
 
-use super::controller::Imxrt1062HostController;
+use super::controller::ImxrtHostController;
 use super::futures::AsyncAdvanceWait;
 use super::statics::UsbStatics;
 use super::{NUM_QH, NUM_QTD};
@@ -72,7 +72,7 @@ impl Drop for QtdSlot {
     }
 }
 
-impl Imxrt1062HostController {
+impl ImxrtHostController {
     // -----------------------------------------------------------------------
     // QH / qTD allocation helpers
     // -----------------------------------------------------------------------
@@ -257,10 +257,8 @@ impl Imxrt1062HostController {
 
     /// Enable the async schedule if not already enabled.
     pub(super) fn enable_async_schedule(&self) {
-        let cmd = ral::read_reg!(ral::usb, self.usb, USBCMD);
-        if cmd & (1 << 5) == 0 {
-            // ASE bit 5
-            ral::modify_reg!(ral::usb, self.usb, USBCMD, |v| v | (1 << 5));
+        if ral::read_reg!(ral::usb, self.usb, USBCMD, ASE == 0) {
+            ral::modify_reg!(ral::usb, self.usb, USBCMD, ASE: 1);
         }
     }
 
@@ -274,8 +272,8 @@ impl Imxrt1062HostController {
             usb: &self.usb,
             shared: self.shared,
         };
-        // Set IAA (Interrupt on Async Advance) bit in USBCMD
-        ral::modify_reg!(ral::usb, self.usb, USBCMD, |v| v | (1 << 6));
+        // Set IAA (Interrupt on Async Advance) in USBCMD
+        ral::modify_reg!(ral::usb, self.usb, USBCMD, IAA: 1);
         waker_future.await;
     }
 

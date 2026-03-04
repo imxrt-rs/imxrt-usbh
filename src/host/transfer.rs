@@ -12,12 +12,12 @@ use core::cell::Cell;
 use cotton_usb_host::host_controller::{DataPhase, TransferExtras, TransferType, UsbError};
 use cotton_usb_host::wire::SetupPacket;
 
-use super::controller::Imxrt1062HostController;
+use super::controller::ImxrtHostController;
 use super::futures::TransferComplete;
-use super::interrupt_pipe::{Imxrt1062InterruptPipe, Pipe};
+use super::interrupt_pipe::{ImxrtInterruptPipe, Pipe};
 use super::NUM_QH;
 
-impl Imxrt1062HostController {
+impl ImxrtHostController {
     // -----------------------------------------------------------------------
     // EHCI error mapping
     // -----------------------------------------------------------------------
@@ -499,7 +499,7 @@ impl Imxrt1062HostController {
             && transfer_type == TransferType::VariableSize
             && data_len > 0
             && actual_packet_size as usize > 0
-            && data_len % actual_packet_size as usize == 0;
+            && data_len.is_multiple_of(actual_packet_size as usize);
 
         // 5. Allocate qTD(s). RAII guards auto-free on early return.
         let data_slot = self.alloc_qtd().ok_or(UsbError::AllPipesInUse)?;
@@ -648,7 +648,7 @@ impl Imxrt1062HostController {
         endpoint: u8,
         max_packet_size: u16,
         _interval_ms: u8,
-    ) -> Imxrt1062InterruptPipe {
+    ) -> ImxrtInterruptPipe {
         // Map pipe slot to pool indices.
         // bulk_pipes tokens are 0..NUM_QH-2; Pipe::new(pooled, 1) makes which=1..NUM_QH-1.
         //   QH index  = pipe.which() as usize + 1  → qh_pool[2..=NUM_QH]
@@ -764,7 +764,7 @@ impl Imxrt1062HostController {
         // Log the periodic schedule chain for diagnostics.
         self.log_periodic_chain();
 
-        Imxrt1062InterruptPipe {
+        ImxrtInterruptPipe {
             pipe,
             qh_index,
             qtd_slot,

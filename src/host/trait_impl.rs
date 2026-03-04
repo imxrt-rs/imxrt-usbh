@@ -1,4 +1,4 @@
-//! `HostController` trait implementation for `Imxrt1062HostController`.
+//! `HostController` trait implementation for `ImxrtHostController`.
 
 use core::cell::Cell;
 use cotton_usb_host::host_controller::{
@@ -6,31 +6,41 @@ use cotton_usb_host::host_controller::{
 };
 use cotton_usb_host::wire::SetupPacket;
 
-use super::controller::Imxrt1062HostController;
-use super::device_detect::Imxrt1062DeviceDetect;
-use super::interrupt_pipe::{Imxrt1062InterruptPipe, Pipe};
+use super::controller::ImxrtHostController;
+use super::device_detect::ImxrtDeviceDetect;
+use super::interrupt_pipe::{ImxrtInterruptPipe, Pipe};
 
 use crate::ehci::{PID_IN, PID_OUT};
 
-impl HostController for Imxrt1062HostController {
-    type InterruptPipe = Imxrt1062InterruptPipe;
-    type DeviceDetect = Imxrt1062DeviceDetect;
+impl HostController for ImxrtHostController {
+    type InterruptPipe = ImxrtInterruptPipe;
+    type DeviceDetect = ImxrtDeviceDetect;
 
     fn device_detect(&self) -> Self::DeviceDetect {
-        Imxrt1062DeviceDetect::new(&self.usb, &self.usbphy, self.shared.device_waker())
+        ImxrtDeviceDetect::new(&self.usb, &self.usbphy, self.shared.device_waker())
     }
 
     fn reset_root_port(&self, rst: bool) {
         if rst {
-            // Set PORTSC1.PR (bit 8) — begin USB reset signaling.
+            // Set PORTSC1.PR — begin USB reset signaling.
             // Must preserve other bits and avoid clearing W1C bits.
             let portsc = self.portsc1_read_safe();
-            crate::ral::write_reg!(crate::ral::usb, self.usb, PORTSC1, portsc | (1 << 8));
+            crate::ral::write_reg!(
+                crate::ral::usb,
+                self.usb,
+                PORTSC1,
+                portsc | crate::ral::usb::PORTSC1::PR::mask
+            );
         } else {
-            // Clear PORTSC1.PR (bit 8) — end USB reset signaling.
+            // Clear PORTSC1.PR — end USB reset signaling.
             // On EHCI, the controller may auto-clear PR and set PE (port enabled).
             let portsc = self.portsc1_read_safe();
-            crate::ral::write_reg!(crate::ral::usb, self.usb, PORTSC1, portsc & !(1 << 8));
+            crate::ral::write_reg!(
+                crate::ral::usb,
+                self.usb,
+                PORTSC1,
+                portsc & !crate::ral::usb::PORTSC1::PR::mask
+            );
         }
     }
 
@@ -121,7 +131,7 @@ impl HostController for Imxrt1062HostController {
         endpoint: u8,
         max_packet_size: u16,
         interval_ms: u8,
-    ) -> Imxrt1062InterruptPipe {
+    ) -> ImxrtInterruptPipe {
         let pipe = Pipe::new(self.statics.bulk_pipes.alloc().await, 1);
         self.do_alloc_interrupt_pipe(
             pipe,
