@@ -3,9 +3,7 @@
 //! Contains the async methods that build qTD chains, link QHs to the
 //! appropriate schedule, and wait for completion.
 
-use crate::ehci::{
-    self, QueueHead, PID_IN, PID_OUT, PID_SETUP, SPEED_FULL, SPEED_HIGH, SPEED_LOW,
-};
+use crate::ehci::{self, QueueHead, PID_IN, PID_OUT, PID_SETUP, SPEED_FULL, SPEED_HIGH, SPEED_LOW};
 use crate::ral;
 use core::cell::Cell;
 use cotton_usb_host::host_controller::{DataPhase, TransferExtras, TransferType, UsbError};
