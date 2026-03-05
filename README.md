@@ -109,6 +109,20 @@ Before calling `init()`, you must configure:
 
 See the RTIC examples for complete initialization sequences.
 
+### Non-Cacheable Memory
+
+The EHCI controller uses DMA to read and write `UsbStatics` (queue heads,
+transfer descriptors, frame list, receive buffers). **This memory must not be
+cached**, or DMA transfers will silently corrupt data.
+
+Two options:
+
+1. **Disable the D-cache entirely** — simplest, no MPU configuration needed.
+2. **Use the MPU** to mark the memory region containing `UsbStatics` as
+   non-cacheable (Device or Strongly Ordered memory type).
+
+The driver performs no cache maintenance internally.
+
 ## Features
 
 | Feature       | Default | Description |
