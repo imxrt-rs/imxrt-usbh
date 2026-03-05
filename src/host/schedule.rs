@@ -2,7 +2,7 @@
 //!
 //! This module contains the low-level helpers for allocating QHs and qTDs
 //! from the static pools, linking/unlinking them from the EHCI async
-//! and periodic schedules, and safe wrappers that combine link+cache
+//! and periodic schedules, and wrappers that combine link+enable
 //! operations.
 
 use crate::ehci::{self, link_pointer, link_type, QueueHead, TransferDescriptor, LINK_TERMINATE};
@@ -114,7 +114,6 @@ impl ImxrtHostController {
     ///
     /// # Safety
     /// - The QH must be fully initialized.
-    /// - Cache must be cleaned after this call.
     pub(super) unsafe fn link_qh_to_async_schedule(&self, qh: *mut QueueHead) {
         // SAFETY: Both `qh` and the sentinel (index 0) are valid pointers from
         // the static QH pool.  The sentinel is always in the async schedule and
@@ -184,7 +183,6 @@ impl ImxrtHostController {
     ///
     /// # Safety
     /// - The QH must be fully initialized (characteristics, capabilities, qTD attached).
-    /// - Cache must be cleaned after this call.
     pub(super) unsafe fn link_qh_to_periodic_schedule(&self, qh: *mut QueueHead) {
         // SAFETY: `qh` is a valid pointer from the static QH pool.  Frame list
         // entries are stable `VCell<u32>` values in the static `FrameList`.  The
@@ -210,7 +208,6 @@ impl ImxrtHostController {
     ///
     /// # Safety
     /// - `qh` must currently be in the periodic schedule.
-    /// - Cache must be cleaned after this call.
     pub(super) unsafe fn unlink_qh_from_periodic_schedule(
         statics: &'static UsbStatics,
         qh: *const QueueHead,
@@ -278,33 +275,22 @@ impl ImxrtHostController {
     }
 
     // -----------------------------------------------------------------------
-    // Combined link + cache + enable helpers
+    // Combined link + enable helpers
     // -----------------------------------------------------------------------
 
-    /// Link a QH into the async schedule with full cache maintenance.
+    /// Link a QH into the async schedule and enable it.
     ///
-    /// Cleans both the QH and sentinel before and after linking, then
-    /// enables the async schedule.  This replaces the repeated 7-line
-    /// link→clean→clean→enable sequence in control and bulk transfers.
+    /// Links the QH after the sentinel and enables the async schedule.
     ///
     /// # Safety
-    /// The QH and its attached qTD chain must be fully initialized and
-    /// cache-cleaned before calling this.
+    /// The QH and its attached qTD chain must be fully initialized.
+    /// DMA buffers must be in non-cacheable memory.
     pub(super) unsafe fn link_and_start_async(&self, qh: *mut QueueHead) {
-        // SAFETY: `qh` and sentinel are valid pool pointers.  Cache maintenance
-        // is applied before and after linking so the DMA engine always sees
-        // coherent descriptor memory.  The caller guarantees the QH and its
-        // qTD chain are fully initialized and cache-cleaned.
+        // SAFETY: `qh` and sentinel are valid pool pointers.  The caller
+        // guarantees the QH and its qTD chain are fully initialized.
+        // DMA structures are in non-cacheable memory.
         unsafe {
-            let sentinel = self.qh_mut(0);
-            Self::cache_clean_qh(qh);
-            Self::cache_clean_qh(sentinel);
-
             self.link_qh_to_async_schedule(qh);
-
-            // Re-clean after linking (horizontal_links of both QH and sentinel changed)
-            Self::cache_clean_qh(qh);
-            Self::cache_clean_qh(sentinel);
         }
 
         self.enable_async_schedule();
@@ -312,23 +298,17 @@ impl ImxrtHostController {
 
     /// Unlink a QH from the async schedule and wait for hardware acknowledgement.
     ///
-    /// Unlinks the QH, cleans the sentinel, rings the async advance doorbell,
-    /// and waits for the controller to acknowledge it is no longer accessing
-    /// the QH.  This replaces the repeated unlink→clean→doorbell→await
-    /// sequence in control and bulk transfers.
+    /// Unlinks the QH, rings the async advance doorbell, and waits for the
+    /// controller to acknowledge it is no longer accessing the QH.
     ///
     /// # Safety
     /// The QH must currently be in the async schedule.
     pub(super) async unsafe fn unlink_and_stop_async(&self, qh: *mut QueueHead) {
         // SAFETY: `qh` is in the async schedule (linked by a prior
-        // `link_and_start_async`).  Sentinel is cleaned after unlinking so the
-        // DMA engine sees the updated circular list.  The doorbell+await
-        // sequence ensures the controller has stopped accessing `qh` before
-        // the caller frees it.
+        // `link_and_start_async`).  The doorbell+await sequence ensures the
+        // controller has stopped accessing `qh` before the caller frees it.
         unsafe {
-            let sentinel = self.qh_mut(0);
             self.unlink_qh_from_async_schedule(qh);
-            Self::cache_clean_qh(sentinel);
         }
 
         self.wait_async_advance().await;

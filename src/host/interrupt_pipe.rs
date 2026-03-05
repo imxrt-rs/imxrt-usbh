@@ -1,7 +1,7 @@
 //! Interrupt IN pipe — periodic schedule endpoint stream with RAII cleanup.
 
 use crate::ehci::{self, PID_IN};
-use crate::{cache, ral};
+use crate::ral;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use cotton_usb_host::host_controller::InterruptPacket;
@@ -11,7 +11,6 @@ use super::controller::ImxrtHostController;
 use super::schedule::QtdSlot;
 use super::shared::UsbShared;
 use super::statics::UsbStatics;
-use super::NUM_QH;
 
 // ---------------------------------------------------------------------------
 // Pipe — RAII pipe allocation wrapper
@@ -96,12 +95,11 @@ impl Stream for ImxrtInterruptPipe {
             addr: self.usb_base as *const ral::usb::RegisterBlock,
         };
 
-        // Invalidate cache to see any hardware updates to the qTD token.
         let qtd_ptr = self.qtd_slot.ptr();
-        ImxrtHostController::cache_clean_qtd(qtd_ptr);
 
         // SAFETY: qTD pointer from QtdSlot::ptr() — valid, aligned static pool
-        // entry exclusively owned by this pipe.  Cache was just invalidated above.
+        // entry exclusively owned by this pipe.  DMA buffers are in non-cacheable
+        // memory so hardware writes are immediately visible.
         let token = unsafe { (*qtd_ptr).token.read() };
 
         if token & ehci::QTD_TOKEN_ACTIVE != 0 {
@@ -128,12 +126,7 @@ impl Stream for ImxrtInterruptPipe {
 
         // --- Transfer complete (Active cleared, no halt) ---
 
-        // Invalidate receive buffer cache before reading the data.
-        // Use invalidate-only (DCIMVAC), NOT clean+invalidate (DCCIMVAC),
-        // because for DMA receive buffers we must NOT write back any stale
-        // dirty cache lines — the RAM contents written by DMA are authoritative.
         let recv_buf = &self.statics.recv_bufs[self.recv_buf_idx];
-        cache::invalidate_dcache_by_address(recv_buf.as_ptr() as usize, recv_buf.len());
 
         debug!(
             "[HC] qTD done: token=0x{:08x} rem={} buf=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
@@ -181,10 +174,6 @@ impl Stream for ImxrtInterruptPipe {
             (*qh_ptr).reattach_qtd_preserve_toggle(rearm_qtd);
         }
 
-        // Flush both the qTD and QH back to RAM for the DMA engine.
-        ImxrtHostController::cache_clean_qtd(rearm_qtd);
-        ImxrtHostController::cache_clean_qh(qh_ptr);
-
         // Re-enable transfer interrupts so the next completion wakes us.
         ral::modify_reg!(ral::usb, usb_inst, USBINTR, UE: 1, UEE: 1, UAIE: 1, UPIE: 1);
 
@@ -201,16 +190,6 @@ impl Drop for ImxrtInterruptPipe {
         // predecessor QH's horizontal_link.
         unsafe {
             ImxrtHostController::unlink_qh_from_periodic_schedule(self.statics, qh_ptr);
-        }
-
-        // Clean the frame list after modification.
-        cache::clean_invalidate_dcache_by_address(
-            self.statics.frame_list.entries.as_ptr() as usize,
-            core::mem::size_of::<ehci::FrameList>(),
-        );
-        // Clean any predecessor QHs whose horizontal_link we may have changed.
-        for i in 2..=NUM_QH {
-            ImxrtHostController::cache_clean_qh(self.statics.qh_ptr(i));
         }
 
         // 2. Wait ≥1 ms for the controller to cross a frame boundary.

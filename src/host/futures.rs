@@ -44,22 +44,15 @@ impl Future for TransferComplete<'_> {
             .pipe_waker(self.waker_index)
             .register(cx.waker());
 
-        // Derive pointers from pool indices for cache maintenance + reads.
+        // Derive pointers from pool indices.
         let status_qtd_ptr = self.statics.qtd_ptr(self.status_qtd_index);
         let data_qtd_ptr = self.data_qtd_index.map(|i| self.statics.qtd_ptr(i));
         let qh_ptr = self.statics.qh_ptr(self.qh_index);
 
-        // Invalidate cache to see hardware updates
-        ImxrtHostController::cache_clean_qtd(status_qtd_ptr);
-        if let Some(dp) = data_qtd_ptr {
-            ImxrtHostController::cache_clean_qtd(dp);
-        }
-        ImxrtHostController::cache_clean_qh(qh_ptr);
-
         // SAFETY: All pointers derived from UsbStatics pool via qtd_ptr()/qh_ptr()
-        // (valid, aligned, `'static` lifetime).  Cache was just invalidated above
-        // so we read DMA-updated values.  Each index is exclusively owned by the
-        // transfer that created this future.
+        // (valid, aligned, `'static` lifetime).  DMA buffers are in non-cacheable
+        // memory so hardware writes are immediately visible.  Each index is
+        // exclusively owned by the transfer that created this future.
         let token = unsafe { (*status_qtd_ptr).token.read() };
 
         if token & QTD_TOKEN_ACTIVE != 0 {

@@ -15,12 +15,13 @@
 //! - **Frame List**: Must be 4096-byte aligned (page-aligned). Size is configurable
 //!   (8, 16, 32, … 1024 entries); we use [`FRAME_LIST_LEN`](crate::ehci::FRAME_LIST_LEN) entries.
 //!
-//! # Cache Coherency
+//! # Non-Cacheable Memory Requirement
 //!
-//! The Cortex-M7 D-cache line size is 32 bytes. All structures in this module are
-//! DMA-visible. Every CPU read must be preceded by a cache invalidate, and every CPU
-//! write must be followed by a cache clean. Use
-//! `crate::cache::clean_invalidate_dcache_by_address` at DMA boundaries.
+//! The implementation assumes that all global memory allocated for DMA structures
+//! (QH, qTD, frame list, data buffers) is placed in non-cacheable memory. The
+//! driver will not flush any cache lines before coordinating with the DMA
+//! controller. Users must either disable the D-cache or use the MPU to mark
+//! DMA regions as non-cacheable.
 //!
 //! # References
 //!
@@ -232,8 +233,7 @@ impl TransferDescriptor {
     /// # Safety
     /// - `data` must be valid for `len` bytes and remain valid until the controller
     ///   completes this qTD.
-    /// - The caller must perform a cache clean after calling this, before the
-    ///   controller accesses the qTD.
+    /// - The qTD must be in non-cacheable memory accessible by the DMA engine.
     pub unsafe fn init(&mut self, token: u32, data: *const u8, _len: u32) {
         self.next.write(LINK_TERMINATE);
         self.alt_next.write(LINK_TERMINATE);
@@ -532,7 +532,7 @@ impl QueueHead {
     /// # Safety
     /// - `qtd` must point to a valid, initialised [`TransferDescriptor`].
     /// - The qTD and its buffers must remain valid until the transfer completes.
-    /// - Cache must be cleaned after this call and before the controller reads the QH.
+    /// - The QH must be in non-cacheable memory accessible by the DMA engine.
     pub unsafe fn attach_qtd(&mut self, qtd: *const TransferDescriptor) {
         let qtd_addr = qtd as u32;
         self.attached_qtd.write(qtd_addr);
@@ -550,7 +550,7 @@ impl QueueHead {
     ///
     /// # Safety
     /// - `qtd` must point to a valid [`TransferDescriptor`] with Active=1.
-    /// - Cache must be cleaned after this call and before the controller reads the QH.
+    /// - The QH must be in non-cacheable memory accessible by the DMA engine.
     pub unsafe fn reattach_qtd_preserve_toggle(&mut self, qtd: *const TransferDescriptor) {
         self.overlay_next.write(qtd as u32);
         // overlay_token intentionally NOT written — controller manages DT bit (DTC=0)
@@ -578,8 +578,7 @@ impl QueueHead {
     /// Inserts `self` between `prev` and whatever `prev` currently points to.
     ///
     /// # Safety
-    /// - Both `self` and `prev` must be valid QHs in stable memory.
-    /// - Cache operations are the caller's responsibility.
+    /// - Both `self` and `prev` must be valid QHs in stable, non-cacheable memory.
     pub unsafe fn link_after(&mut self, prev: &mut QueueHead) {
         let self_addr = (self as *const Self) as u32;
         // self → prev's old successor

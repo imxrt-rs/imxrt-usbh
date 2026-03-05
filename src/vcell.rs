@@ -9,8 +9,8 @@
 //! - Both `&self` (shared) and `&mut self` access patterns are needed
 //!
 //! `VCell` is `!Sync` by default (due to `UnsafeCell`), which is correct
-//! for DMA structures — synchronization is handled by cache maintenance
-//! and EHCI schedule management.
+//! for DMA structures — synchronization is handled by EHCI schedule
+//! management and non-cacheable memory placement.
 
 use core::cell::UnsafeCell;
 use core::ptr;
@@ -43,8 +43,8 @@ impl<T: Copy> VCell<T> {
     /// ensure the write is not elided or reordered by the compiler.
     pub fn write(&self, val: T) {
         // Safety: volatile write to a valid memory location. The caller
-        // is responsible for ensuring no data races (via cache maintenance
-        // and EHCI schedule management).
+        // is responsible for ensuring no data races (via EHCI schedule
+        // management and non-cacheable memory placement).
         unsafe { ptr::write_volatile(self.0.get(), val) }
     }
 }

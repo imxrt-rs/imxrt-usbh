@@ -155,12 +155,12 @@ impl ImxrtHostController {
     /// 11. Enable host disconnect detection in PHY
     /// 12. Enable interrupts
     ///
-    /// # Cache Coherency
+    /// # Non-Cacheable Memory
     ///
-    /// All DMA structures (QH, qTD, frame list, data buffers) are placed in
-    /// OCRAM2 (not DTCM) and require explicit cache maintenance before and
-    /// after DMA operations.  See [`docs/design/CACHE_COHERENCY.md`] for the
-    /// full policy.
+    /// The driver assumes all DMA structures (QH, qTD, frame list, data
+    /// buffers) are in non-cacheable memory. The driver does not perform
+    /// any cache maintenance. Users must either disable the D-cache or
+    /// use the MPU to mark DMA regions as non-cacheable.
     ///
     /// # Register Alias: `DEVICEADDR` / `PERIODICLISTBASE`
     ///

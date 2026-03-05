@@ -4,10 +4,9 @@
 //! appropriate schedule, and wait for completion.
 
 use crate::ehci::{
-    self, QueueHead, TransferDescriptor, PID_IN, PID_OUT, PID_SETUP, SPEED_FULL, SPEED_HIGH,
-    SPEED_LOW,
+    self, QueueHead, PID_IN, PID_OUT, PID_SETUP, SPEED_FULL, SPEED_HIGH, SPEED_LOW,
 };
-use crate::{cache, ral};
+use crate::ral;
 use core::cell::Cell;
 use cotton_usb_host::host_controller::{DataPhase, TransferExtras, TransferType, UsbError};
 use cotton_usb_host::wire::SetupPacket;
@@ -63,30 +62,6 @@ impl ImxrtHostController {
     }
 
     // -----------------------------------------------------------------------
-    // Cache maintenance wrappers
-    // -----------------------------------------------------------------------
-
-    /// Clean and invalidate a QH for DMA.
-    pub(super) fn cache_clean_qh(qh: *const QueueHead) {
-        cache::clean_invalidate_dcache_by_address(qh as usize, core::mem::size_of::<QueueHead>());
-    }
-
-    /// Clean and invalidate a qTD for DMA.
-    pub(super) fn cache_clean_qtd(qtd: *const TransferDescriptor) {
-        cache::clean_invalidate_dcache_by_address(
-            qtd as usize,
-            core::mem::size_of::<TransferDescriptor>(),
-        );
-    }
-
-    /// Clean and invalidate a data buffer for DMA.
-    pub(super) fn cache_clean_buffer(addr: *const u8, len: usize) {
-        if len > 0 {
-            cache::clean_invalidate_dcache_by_address(addr as usize, len);
-        }
-    }
-
-    // -----------------------------------------------------------------------
     // Diagnostic helpers
     // -----------------------------------------------------------------------
 
@@ -136,13 +111,8 @@ impl ImxrtHostController {
                 }
                 // Follow horizontal_link
                 let qh_ptr = addr as *const QueueHead;
-                cache::clean_invalidate_dcache_by_address(
-                    qh_ptr as usize,
-                    core::mem::size_of::<QueueHead>(),
-                );
                 // SAFETY: `addr` is extracted from the frame list or a QH's
                 // horizontal_link, which points to a QH in the static pool.
-                // Cache was just invalidated above.
                 link = unsafe { (*qh_ptr).horizontal_link.read() };
             }
             let chain_str = core::str::from_utf8(&chain_buf[..pos]).unwrap_or("??");
@@ -324,26 +294,9 @@ impl ImxrtHostController {
         // writes the qTD address into the QH overlay and clears the halt bit.
         unsafe { (*qh).attach_qtd(setup_qtd) };
 
-        // ---- Cache maintenance before DMA ----
+        // ---- Link QH to async schedule and enable ----
 
-        // Clean the setup packet data (it's on the stack, needs to be in RAM)
-        Self::cache_clean_buffer(setup_bytes, 8);
-
-        // Clean outgoing data buffer if applicable
-        if let DataPhase::Out(buf) = data_phase {
-            Self::cache_clean_buffer(buf.as_ptr(), buf.len());
-        }
-
-        // Clean all qTDs
-        Self::cache_clean_qtd(setup_qtd);
-        if let Some(ref slot) = data_slot {
-            Self::cache_clean_qtd(slot.ptr());
-        }
-        Self::cache_clean_qtd(status_qtd);
-
-        // ---- Link QH to async schedule, clean, and enable ----
-
-        // SAFETY: QH and its qTD chain are fully initialized and cache-cleaned.
+        // SAFETY: QH and its qTD chain are fully initialized.
         // link_and_start_async handles sentinel linkage and schedule enable.
         unsafe { self.link_and_start_async(qh) };
 
@@ -371,16 +324,12 @@ impl ImxrtHostController {
         let bytes_transferred = match result {
             Ok(()) => {
                 match data_phase {
-                    DataPhase::In(ref mut buf) => {
-                        // Invalidate cache for the IN data buffer
-                        Self::cache_clean_buffer(buf.as_ptr(), buf.len());
-
+                    DataPhase::In(ref mut _buf) => {
                         // Read how many bytes were actually transferred
                         if let Some(ref slot) = data_slot {
                             let data_qtd_ptr = slot.ptr();
-                            // Invalidate cache to read updated qTD token
-                            Self::cache_clean_qtd(data_qtd_ptr);
-                            // SAFETY: data qTD pointer from QtdSlot; cache just invalidated.
+                            // SAFETY: data qTD pointer from QtdSlot; DMA buffers are in
+                            // non-cacheable memory so hardware writes are immediately visible.
                             let remaining = unsafe { (*data_qtd_ptr).bytes_remaining() } as usize;
                             Ok(data_len - remaining)
                         } else {
@@ -394,17 +343,12 @@ impl ImxrtHostController {
             Err(e) => {
                 // Log raw qTD tokens for diagnosis
                 // SAFETY: All qTD pointers from QtdSlot, valid pool entries.
-                // Cache is cleaned before each read to see hardware-updated values.
-                Self::cache_clean_qtd(setup_qtd);
+                // DMA buffers are in non-cacheable memory so reads see hardware values.
                 let setup_token_val = unsafe { (*setup_qtd).token.read() };
                 let status_token_val = unsafe { (*status_qtd).token.read() };
                 let data_token_val = data_slot
                     .as_ref()
-                    .map(|s| {
-                        let p = s.ptr();
-                        Self::cache_clean_qtd(p);
-                        unsafe { (*p).token.read() }
-                    })
+                    .map(|s| unsafe { (*s.ptr()).token.read() })
                     .unwrap_or(0);
                 let portsc = ral::read_reg!(ral::usb, self.usb, PORTSC1);
                 debug!("[HC] control xfer FAILED: err={} setup_tok=0x{:08X} data_tok=0x{:08X} status_tok=0x{:08X} PORTSC1=0x{:08X}",
@@ -539,18 +483,8 @@ impl ImxrtHostController {
             unsafe { (*qh).set_overlay_toggle(true) };
         }
 
-        // 9. For OUT: clean the outgoing data buffer before DMA starts.
-        if !is_in && data_len > 0 {
-            Self::cache_clean_buffer(data as *const u8, data_len);
-        }
-
-        // 10. Clean qTDs, then link+clean+enable via helper.
-        Self::cache_clean_qtd(data_qtd);
-        if let Some(ref zlp) = zlp_slot {
-            Self::cache_clean_qtd(zlp.ptr());
-        }
-
-        // SAFETY: QH and qTD chain fully initialized and cache-cleaned above.
+        // 9. Link QH to async schedule and enable.
+        // SAFETY: QH and qTD chain fully initialized above.
         unsafe { self.link_and_start_async(qh) };
 
         // 12. Poll for transfer completion.
@@ -587,13 +521,9 @@ impl ImxrtHostController {
         let byte_result: Result<usize, UsbError> = match result {
             Ok(()) => {
                 if is_in {
-                    // Invalidate the IN data buffer (DMA wrote to it; don't write back).
-                    if data_len > 0 {
-                        cache::invalidate_dcache_by_address(data as usize, data_len);
-                    }
-                    // Invalidate+read the data qTD token to compute bytes received.
-                    Self::cache_clean_qtd(data_qtd);
-                    // SAFETY: data qTD pointer from QtdSlot; cache just invalidated.
+                    // Read the data qTD token to compute bytes received.
+                    // SAFETY: data qTD pointer from QtdSlot; DMA buffers are in
+                    // non-cacheable memory so hardware writes are immediately visible.
                     let token = unsafe { (*data_qtd).token.read() };
                     let remaining = ehci::qtd_token_bytes_remaining(token) as usize;
                     Ok(data_len.saturating_sub(remaining))
@@ -611,8 +541,8 @@ impl ImxrtHostController {
         // 15. Read the data toggle from the QH overlay for the next transfer.
         //     The controller writes the next expected toggle into the overlay_token
         //     DT bit (bit 31) when it updates the overlay at end-of-transfer.
-        Self::cache_clean_qh(qh);
-        // SAFETY: QH pointer from pool; cache just invalidated; QH unlinked.
+        // SAFETY: QH pointer from pool; QH unlinked; DMA buffers are in
+        // non-cacheable memory so hardware writes are immediately visible.
         let new_toggle = unsafe { (*qh).overlay_token.read() } & (1 << 31) != 0;
         data_toggle.set(new_toggle);
 
@@ -721,25 +651,9 @@ impl ImxrtHostController {
         // SAFETY: `qh` and `qtd` are valid pool pointers; no DMA active yet.
         unsafe { (*qh).attach_qtd(qtd) };
 
-        // Cache maintenance: clean qTD, recv_buf, QH, and frame list before linking.
-        Self::cache_clean_qtd(qtd);
-        Self::cache_clean_buffer(recv_buf_ptr, max_packet_size as usize);
-        Self::cache_clean_qh(qh);
-        cache::clean_invalidate_dcache_by_address(
-            self.statics.frame_list.entries.as_ptr() as usize,
-            core::mem::size_of::<ehci::FrameList>(),
-        );
-
         // Insert QH at the head of the periodic schedule.
-        // SAFETY: QH fully initialized with qTD attached, all cache-cleaned above.
+        // SAFETY: QH fully initialized with qTD attached.
         unsafe { self.link_qh_to_periodic_schedule(qh) };
-
-        // Cache-clean QH (horizontal_link changed) and frame list (all entries changed).
-        Self::cache_clean_qh(qh);
-        cache::clean_invalidate_dcache_by_address(
-            self.statics.frame_list.entries.as_ptr() as usize,
-            core::mem::size_of::<ehci::FrameList>(),
-        );
 
         // Diagnostic: log speed, QH config, and periodic schedule chain.
         let extras_str = match transfer_extras {

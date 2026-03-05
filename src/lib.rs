@@ -37,8 +37,6 @@
 #[macro_use]
 mod log;
 
-mod cache;
-
 /// EHCI data structures: Queue Heads, Transfer Descriptors, and frame lists.
 ///
 /// These are the hardware-defined DMA structures that the EHCI controller

@@ -12,9 +12,8 @@ use super::{NUM_QH, NUM_QTD};
 
 /// A 32-byte-aligned receive buffer for DMA.
 ///
-/// Each buffer is 64 bytes (2 cache lines). The 32-byte alignment ensures
-/// that cache maintenance operations on a receive buffer cannot corrupt
-/// adjacent data in the same cache line.
+/// Each buffer is 64 bytes. The 32-byte alignment satisfies EHCI DMA
+/// alignment requirements.
 #[repr(C, align(32))]
 pub struct RecvBuf(pub [u8; 64]);
 
@@ -84,9 +83,9 @@ impl core::ops::Index<core::ops::RangeTo<usize>> for RecvBuf {
 ///
 /// # Memory
 ///
-/// All DMA-visible arrays (`qh_pool`, `qtd_pool`, `frame_list`) must be in
-/// normal RAM (not TCM) if using cache management, or in DTCM if bypassing
-/// the data cache.
+/// All DMA-visible arrays (`qh_pool`, `qtd_pool`, `frame_list`, `recv_bufs`)
+/// must be in non-cacheable memory. Either disable the D-cache or use the
+/// MPU to mark the region as non-cacheable.
 pub struct UsbStatics {
     /// Pool for control pipe slots (1 slot — only one EP0 at a time).
     pub control_pipes: Pool,
@@ -124,9 +123,9 @@ pub struct UsbStatics {
 
     /// Receive buffers for interrupt pipes.
     ///
-    /// One 64-byte buffer per interrupt pipe slot, 32-byte aligned for cache
-    /// line safety. These live in a `static` so their addresses are stable
-    /// for the DMA engine. Index matches the `bulk_pipes` pool token
+    /// One 64-byte buffer per interrupt pipe slot, 32-byte aligned for DMA
+    /// access. These live in a `static` so their addresses are stable for
+    /// the DMA engine. Index matches the `bulk_pipes` pool token
     /// (0..NUM_QH-2).
     pub recv_bufs: [RecvBuf; NUM_QH - 1],
 }

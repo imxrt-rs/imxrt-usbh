@@ -35,20 +35,19 @@ and manage USB hubs. The stack is layered as follows:
 ├─────────────────────────────────────────────────┤
 │  cotton-usb-host-hid / cotton-usb-host-msc      │  (device class drivers)
 ├─────────────────────────────────────────────────┤
-│     UsbBus<HC: HostController>                  │  (hardware-agnostic bus logic)
-│  - device enumeration, hub support              │
-│  - address assignment, configuration            │
-│  - device_events() stream                       │
+│  UsbBus<HC: HostController>                     │  (hardware-agnostic bus logic)
+│    - device enumeration, hub support            │
+│    - address assignment, configuration          │
+│    - device_events() stream                     │
 ├─────────────────────────────────────────────────┤
-│     HostController trait                        │  (abstraction boundary)
+│  HostController trait                           │  (abstraction boundary)
 ├─────────────────────────────────────────────────┤
-│  ImxrtHostController      (this crate)      │
-│  UsbShared (ISR ↔ async task)                   │
-│  UsbStatics (pipe/QH/qTD pools)                 │
-│  Cache coherency layer                          │
+│  ImxrtHostController               (this crate) │
+│  UsbShared                   (ISR ↔ async task) │
+│  UsbStatics                 (pipe/QH/qTD pools) │
 ├─────────────────────────────────────────────────┤
 │  imxrt-ral USB2/USBPHY2       (register access) │
-│  EHCI hardware (QH/qTD DMA engine)              │
+│  EHCI hardware              (QH/qTD DMA engine) │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -68,7 +67,7 @@ implementation in cotton-usb-host:
 |-------|---------|
 | `cotton-usb-host` (0.2.1+) | `HostController` trait, `UsbBus`, `Pool`/`Pooled` allocation |
 | `imxrt-ral` (0.6) | Register definitions and `read_reg!`/`write_reg!`/`modify_reg!` macros |
-| `cortex-m` (0.7+) | Cache management intrinsics, memory barriers |
+| `cortex-m` (0.7+) | CPU delay intrinsics |
 | `rtic-common` (1) | `CriticalSectionWakerRegistration` for ISR↔async waker communication |
 | `static-cell` | `ConstStaticCell` for `'static` lifetime pools |
 | `defmt` / `log` | Optional, feature-gated debug logging |
@@ -82,7 +81,6 @@ src/
 ├── lib.rs              — Crate root: #![no_std], module declarations, cotton re-exports
 ├── ehci.rs             — EHCI DMA structures: QueueHead, TransferDescriptor, FrameList,
 │                         link pointer helpers, token/characteristic builders (~590 lines)
-├── cache.rs            — D-cache clean + invalidate wrappers for DMA coherency
 ├── vcell.rs            — VCell<T>: volatile cell using UnsafeCell for DMA-visible structures
 ├── gpt.rs              — USB OTG built-in general purpose timer abstraction
 ├── log.rs              — Conditional defmt/log macros (feature-gated)
@@ -94,7 +92,7 @@ src/
     ├── controller.rs    — ImxrtHostController: struct, new(), init(), port helpers
     ├── schedule.rs      — QH/qTD allocation (QtdSlot RAII), async/periodic schedule management
     ├── transfer.rs      — do_control_transfer, do_bulk_transfer, do_alloc_interrupt_pipe,
-    │                      cache wrappers, periodic chain diagnostics
+    │                      periodic chain diagnostics
     ├── futures.rs       — TransferComplete future, AsyncAdvanceWait future
     ├── device_detect.rs — ImxrtDeviceDetect: Stream<Item = DeviceStatus>
     ├── interrupt_pipe.rs — ImxrtInterruptPipe: Stream<Item = InterruptPacket>, with Drop cleanup
@@ -209,8 +207,7 @@ calls and ensures cleanup on error paths.
    - SETUP qTD: PID=SETUP, 8 bytes, data toggle=DATA0.
    - DATA qTD (optional): PID=IN or OUT, toggle=DATA1, buffer points to caller's data.
    - STATUS qTD: PID opposite of data direction, 0 bytes (ZLP), toggle=DATA1, IOC=1.
-5. **Cache clean**: Flush setup packet, all qTDs, QH, and any outgoing data buffer.
-6. **Link QH** to async schedule (after sentinel QH), enable ASE if needed.
+5. **Link QH** to async schedule (after sentinel QH), enable ASE if needed.
 7. **Await completion**: `TransferComplete` future registers a waker, re-enables
    transfer interrupts, and polls the status qTD's token for Active=0.
 8. **Check errors**: Map EHCI error bits to `UsbError` variants.
@@ -259,7 +256,7 @@ RP2040 reference implementation) to prevent IRQ storms:
 
 1. Register waker with the appropriate `CriticalSectionWakerRegistration`.
 2. **Re-enable** the relevant interrupt bits in `USBINTR`.
-3. Cache-invalidate the QH/qTD and check hardware status.
+3. Check hardware status in the QH/qTD (visible immediately in non-cacheable memory).
 4. Return `Pending` (wait for next wake) or `Ready` (transfer done).
 
 The waker registration happens **before** re-enabling interrupts to avoid a race
@@ -277,47 +274,28 @@ which avoids exposing RAL types to application code.
 
 ## Cache Coherency
 
-Cache coherency is the **#1 source of bugs** in this driver. The Cortex-M7 has a
-32KB write-back L1 data cache that operates on 32-byte cache lines. The USB EHCI
-controller's DMA engine bypasses this cache entirely.
+The driver assumes all DMA memory is placed in **non-cacheable** memory. It does
+**not** perform any cache maintenance (clean, invalidate, or flush) before or
+after DMA operations. This matches the approach used by `imxrt-enet-qos` and
+other imxrt DMA drivers.
 
-### Rules
+### User Responsibilities
 
-| Situation | Required Operation | Function |
-|-----------|--------------------|----------|
-| CPU wrote data that DMA will read | **Clean** (flush dirty lines to memory) | `cache_clean_qh()`, `cache_clean_qtd()`, `cache_clean_buffer()` |
-| DMA wrote data that CPU will read | **Invalidate** (discard cached copy) | `invalidate_dcache_by_address()` |
-| Bidirectional structure (QH overlay) | **Clean + Invalidate** | `clean_invalidate_dcache_by_address()` |
+Users must ensure that DMA buffers are not cached. Two common approaches:
 
-### Alignment
+1. **Disable the D-cache entirely** — simplest; no MPU configuration needed.
+2. **Use the MPU** to mark the memory region containing `UsbStatics` as
+   non-cacheable (Device or Strongly Ordered memory type).
 
-DMA structures must be aligned to cache line boundaries to prevent **false sharing**
-(where a cache operation on one structure corrupts an adjacent one):
+### EHCI Alignment Requirements
 
-- QueueHead: `#[repr(C, align(64))]` — 2 full cache lines, padded from 48 to 64 bytes.
-- TransferDescriptor: `#[repr(C, align(32))]` — exactly 1 cache line.
-- FrameList: `#[repr(C, align(4096))]` — page-aligned.
+DMA structures still have hardware-mandated alignment requirements (these are
+EHCI requirements, not cache requirements):
 
-### Alternative: DTCM Placement
-
-The i.MX RT's DTCM (Data Tightly-Coupled Memory, at `0x2000_0000`) is not cached
-and has single-cycle deterministic access. Placing QH/qTD pools in DTCM via a
-linker section (`#[link_section = ".dtcm_dma"]`) would eliminate cache coherency
-concerns for descriptors entirely, though data buffers (caller-provided) would
-still need cache management. This approach is not currently used but is a viable
-optimization.
-
-### Debugging Cache Issues
-
-- **Symptom**: "Works sometimes" or "works at low speed but fails at high speed."
-- **Quick test**: Disable the D-cache entirely — if the problem disappears, it's
-  a cache coherency bug.
-- **Nuclear option**: `scb.clean_invalidate_dcache()` (flush entire cache) before
-  each DMA boundary — slow but proves correctness.
-- **Traps**: Adding `defmt` prints or delays can "fix" the issue by causing
-  incidental cache evictions.
-
-For a comprehensive treatment, see `docs/design/CACHE_COHERENCY.md`.
+- QueueHead: `#[repr(C, align(64))]` — EHCI §3.6 requires 32-byte alignment;
+  64 bytes avoids straddling two QHs.
+- TransferDescriptor: `#[repr(C, align(32))]` — EHCI §3.5.
+- FrameList: `#[repr(C, align(4096))]` — page-aligned per EHCI spec.
 
 ---
 
@@ -483,20 +461,18 @@ an empty schedule.
 2. **Isochronous transfer support** — iTD/siTD descriptors for audio/video.
 3. **USB1 controller support** — same register layout, different base address.
 4. **i.MX RT 1050/1064/1170 support** — similar EHCI controllers, minor adaptations.
-5. **DTCM placement** for QH/qTD pools — eliminates cache coherency concerns.
-6. **Proper periodic schedule tree** — binary scheduling tree for optimal bandwidth.
-7. **Performance optimization** — batch cache operations, reduce ISR wake scope.
+5. **Proper periodic schedule tree** — binary scheduling tree for optimal bandwidth.
+6. **Performance optimization** — reduce ISR wake scope.
 
 ---
 
 ## Common Pitfalls
 
-### Cache Coherency (the #1 bug source)
+### Non-Cacheable Memory
 
-- Always flush (clean) outgoing structures before DMA reads them.
-- Always invalidate incoming structures before the CPU reads them.
-- Adding `defmt` prints or delays can mask cache bugs by causing incidental evictions.
-- If a transfer "works sometimes," suspect cache coherency first.
+DMA buffers must be in non-cacheable memory. If the D-cache is enabled and DMA
+memory is cacheable, transfers will silently corrupt data. Either disable the
+D-cache or use the MPU to mark DMA regions as non-cacheable.
 
 ### PORTSC1 Write-1-to-Clear Bits
 
@@ -580,7 +556,5 @@ the examples for correct priority assignments.
 
 ### Design Documents (in this repository)
 
-- `docs/design/CACHE_COHERENCY.md` — Comprehensive cache coherency guide with
-  examples, problem taxonomy, and solution patterns.
 - `docs/design/USB_CONTROL_TRANSFERS.md` — Detailed walkthrough of EHCI control
   transfer mechanics including complete annotated code examples.
