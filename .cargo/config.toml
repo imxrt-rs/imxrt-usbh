@@ -1,0 +1,10 @@
+# Link the Teensy 4.1 example with the runtime the `board` crate generates
+# (imxrt-rt), the same flags imxrt-hal's own examples use. Library builds are
+# unaffected.
+[target.'cfg(all(target_arch = "arm", target_os = "none"))']
+rustflags = [
+    "-C", "link-arg=-Timxrt-link.x",
+    "-C", "link-arg=-Tdefmt.x",
+    "-C", "link-arg=-Tdevice.x",
+    "-C", "link-arg=-nmagic",
+]
