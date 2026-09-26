@@ -49,9 +49,9 @@ dependencies = [
 
 [[package]]
 name = "cotton-usb-host"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f70a9adc55d2ec8b273ab58d7ca1d5f74a9e55089c8198e3a26fd188d511a9"
+checksum = "3962d1bba40f767b5687b2014ee0c2773c6a22c640103692c035ccd9509be675"
 dependencies = [
  "bytemuck",
  "critical-section",
