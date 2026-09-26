@@ -26,5 +26,27 @@ defmt-03 = ["dep:defmt-03"]
 log = ["dep:log"]
 hub-support = []
 
+# The Teensy 4.1 example builds against the sibling checkouts of imxrt-hal
+# (its `board` crate and `imxrt-log`) so the example follows local changes.
+[dev-dependencies]
+board = { path = "../imxrt-hal/board", features = ["teensy4"] }
+imxrt-log = { path = "../imxrt-hal/logging", default-features = false, features = ["log", "lpuart", "usbd"] }
+imxrt-ral = { version = "0.6", features = ["imxrt1062"] }
+imxrt-rt = "0.1.7"
+imxrt-usbd = "0.4"
+rtic = { version = "2", features = ["thumbv7-backend"] }
+log = "0.4"
+futures = { version = "0.3", default-features = false }
+cotton-usb-host-midi = { path = "../cotton/cotton-usb-host-midi", default-features = false }
+
+[[example]]
+name = "rtic_usb_midi_keyboard"
+required-features = ["imxrt-ral/imxrt1062"]
+
 [package.metadata.docs.rs]
 default-target = "thumbv7em-none-eabihf"
+
+# One cotton-usb-host for the crate and for the sibling MIDI class crate,
+# otherwise the example sees two copies of the traits.
+[patch.crates-io]
+cotton-usb-host = { path = "../cotton/cotton-usb-host" }
