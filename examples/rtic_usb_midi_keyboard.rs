@@ -32,6 +32,8 @@
 //!
 //! ```sh
 //! cargo build --release --target thumbv7em-none-eabihf --example rtic_usb_midi_keyboard --features=imxrt-ral/imxrt1062
+//! # or, to reach a device through a hub (forces Full Speed):
+//! cargo build --release --target thumbv7em-none-eabihf --example rtic_usb_midi_keyboard --features=imxrt-ral/imxrt1062,hub-support
 //! rust-objcopy -O ihex target/thumbv7em-none-eabihf/release/examples/rtic_usb_midi_keyboard rtic_usb_midi_keyboard.hex
 //! teensy_loader_cli --mcu=TEENSY41 -w -v rtic_usb_midi_keyboard.hex
 //! ```
@@ -43,6 +45,8 @@
 mod app {
     use core::pin::pin;
     use cotton_usb_host::device::identify::IdentifyFromDescriptors;
+    #[cfg(feature = "hub-support")]
+    use cotton_usb_host::usb_bus::HubState;
     use cotton_usb_host::usb_bus::{DeviceEvent, UsbBus};
     use cotton_usb_host_midi::{IdentifyMidi, Midi, UsbMidiEventPacket};
     use futures::StreamExt;
@@ -221,6 +225,69 @@ mod app {
     }
 
     // -----------------------------------------------------------------------
+    // Enumeration retry
+    // -----------------------------------------------------------------------
+    //
+    // Some devices do not answer the first GET_DESCRIPTOR after a port reset.
+    // The one this was written for (a Donner StarryCtrl, Jieli chipset) ACKs the
+    // SETUP packet and then fails the IN data phase three times, after which the
+    // controller disables the port. It does the same to other host stacks, where
+    // the cure is to unplug it and plug it in again until it takes.
+    //
+    // On an enumeration error the task therefore resets the port and
+    // enumerates again. The timing of each attempt is cotton-usb-host's own.
+    // Bench, StarryCtrl on a Teensy 4.1: the first attempt fails and the second
+    // works, every time. Waiting longer after the reset, or before it, does
+    // not help; it is the second reset that does.
+
+    /// How many times to enumerate a device before asking for a replug.
+    const ENUM_ATTEMPTS: usize = 5;
+
+    /// Pause before each retry, in ms.
+    const ENUM_RETRY_PAUSE_MS: usize = 200;
+
+    /// The delay handed to cotton-usb-host for enumeration.
+    ///
+    /// It waits exactly as long as it is asked to. The only addition is a log
+    /// of the root port's state after the two waits cotton makes around a port
+    /// reset, 50 ms holding it and 10 ms of recovery, which is the only place
+    /// an application can see the port between the reset and the first
+    /// request. The two are recognised by their length; if cotton changes
+    /// them, the log lines stop and nothing else does.
+    fn enum_delay_ms(ms: usize) -> impl core::future::Future<Output = ()> {
+        let what = match ms {
+            50 => "end of reset hold",
+            10 => "end of recovery",
+            _ => "",
+        };
+        // `delay_ms` does its waiting when it is called, not when awaited.
+        let done = delay_ms(ms);
+        if !what.is_empty() {
+            log_port(what);
+        }
+        done
+    }
+
+    /// Log the root port's status register with the fields that matter during
+    /// a reset picked out: connected, enabled, reset in progress, high-speed,
+    /// and the negotiated speed (0 full, 1 low, 2 high).
+    fn log_port(what: &str) {
+        let usb = unsafe { ral::usb::USB2::instance() };
+        let portsc = ral::read_reg!(ral::usb, usb, PORTSC1);
+        log::info!(
+            "port at {}: PORTSC1=0x{:08X} CCS={} PE={} PEC={} PR={} HSP={} PSPD={}",
+            what,
+            portsc,
+            portsc & 1,
+            (portsc >> 2) & 1,
+            (portsc >> 3) & 1,
+            (portsc >> 8) & 1,
+            (portsc >> 9) & 1,
+            (portsc >> 26) & 3,
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Static resources
     // -----------------------------------------------------------------------
 
@@ -339,114 +406,155 @@ mod app {
         log::info!("Entering device event loop...");
 
         let bus = UsbBus::new(host);
-        let mut events = pin!(bus.device_events_no_hubs(delay_ms));
+        let mut attempt: usize = 0;
 
-        loop {
-            match events.next().await {
-                Some(DeviceEvent::Connect(device, info)) => {
-                    if info.class == 9 {
-                        log::warn!("Hub detected — not supported in this example");
-                        continue;
-                    }
+        'port: loop {
+            // A fresh stream starts out believing the port is empty, so a device
+            // that is still plugged in is reported as a new connection and gets
+            // a port reset and a full enumeration. That is the retry.
+            //
+            // With `hub-support` the stream is the hub-aware one, and a retry
+            // resets the root port, which is the hub: everything behind it is
+            // enumerated again from a fresh `HubState`.
+            #[cfg(feature = "hub-support")]
+            let hub_state: HubState<ImxrtHostController> = HubState::default();
+            #[cfg(feature = "hub-support")]
+            let mut events = pin!(bus.device_events(&hub_state, enum_delay_ms));
+            #[cfg(not(feature = "hub-support"))]
+            let mut events = pin!(bus.device_events_no_hubs(enum_delay_ms));
 
-                    log::info!(
-                        "DeviceEvent::Connect  addr={}  VID={:04x} PID={:04x} class={}",
-                        device.address(),
-                        info.vid,
-                        info.pid,
-                        info.class,
-                    );
+            loop {
+                match events.next().await {
+                    Some(DeviceEvent::Connect(device, info)) => {
+                        if attempt > 0 {
+                            log::info!("Enumerated on attempt {}", attempt + 1);
+                        }
+                        attempt = 0;
 
-                    // Walk configuration descriptors to find MIDI interface.
-                    let mut identifier = IdentifyMidi::default();
-                    if let Err(_e) = bus.get_configuration(&device, &mut identifier).await {
-                        log::warn!("get_configuration failed");
-                        continue;
-                    }
-
-                    let config_value = match identifier.identify() {
-                        Some(v) => v,
-                        None => {
-                            log::info!("Not a MIDI device, skipping");
+                        if info.class == 9 {
+                            log::warn!("Hub detected: rebuild with --features=hub-support to look behind it");
                             continue;
                         }
-                    };
 
-                    let in_ep = match identifier.in_endpoint() {
-                        Some(ep) => ep,
-                        None => {
-                            log::warn!("MIDI interface found but no bulk IN endpoint");
+                        log::info!(
+                            "DeviceEvent::Connect  addr={}  VID={:04x} PID={:04x} class={}",
+                            device.address(),
+                            info.vid,
+                            info.pid,
+                            info.class,
+                        );
+
+                        // Walk configuration descriptors to find MIDI interface.
+                        let mut identifier = IdentifyMidi::default();
+                        if let Err(_e) = bus.get_configuration(&device, &mut identifier).await {
+                            log::warn!("get_configuration failed");
                             continue;
                         }
-                    };
-                    let out_ep = identifier.out_endpoint();
 
-                    log::info!(
-                        "MIDI Streaming interface found: bulk_in={} bulk_out={}",
-                        in_ep,
-                        out_ep.map_or(-1i8, |e| e as i8),
-                    );
+                        let config_value = match identifier.identify() {
+                            Some(v) => v,
+                            None => {
+                                log::info!("Not a MIDI device, skipping");
+                                continue;
+                            }
+                        };
 
-                    // Configure the device (SET_CONFIGURATION).
-                    let usb_device = match bus.configure(device, config_value).await {
-                        Ok(d) => d,
-                        Err(_e) => {
-                            log::warn!("configure failed");
-                            continue;
-                        }
-                    };
+                        let in_ep = match identifier.in_endpoint() {
+                            Some(ep) => ep,
+                            None => {
+                                log::warn!("MIDI interface found but no bulk IN endpoint");
+                                continue;
+                            }
+                        };
+                        let out_ep = identifier.out_endpoint();
 
-                    // Create the MIDI driver.
-                    let midi = match Midi::new(&bus, usb_device, in_ep, out_ep) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            log::warn!("Midi::new failed: {}", usb_err(&e));
-                            continue;
-                        }
-                    };
+                        log::info!(
+                            "MIDI Streaming interface found: bulk_in={} bulk_out={}",
+                            in_ep,
+                            out_ep.map_or(-1i8, |e| e as i8),
+                        );
 
-                    log::info!("MIDI device ready, reading packets...");
+                        // Configure the device (SET_CONFIGURATION).
+                        let usb_device = match bus.configure(device, config_value).await {
+                            Ok(d) => d,
+                            Err(_e) => {
+                                log::warn!("configure failed");
+                                continue;
+                            }
+                        };
 
-                    // Bulk IN receive buffer — must be in static memory for DMA.
-                    // 64 bytes = max full-speed bulk packet = up to 16 MIDI events.
-                    static mut RECV_BUF: [u8; 64] = [0u8; 64];
-                    let recv_buf = unsafe { &mut *core::ptr::addr_of_mut!(RECV_BUF) };
+                        // Create the MIDI driver.
+                        let midi = match Midi::new(&bus, usb_device, in_ep, out_ep) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                log::warn!("Midi::new failed: {}", usb_err(&e));
+                                continue;
+                            }
+                        };
 
-                    let mut packet_buf = [UsbMidiEventPacket::from_bytes([0; 4]); 16];
+                        log::info!("MIDI device ready, reading packets...");
 
-                    loop {
-                        match midi.read_packets(recv_buf, &mut packet_buf).await {
-                            Ok(count) => {
-                                for i in 0..count {
-                                    let note_on = log_midi_packet(&packet_buf[i]);
-                                    if note_on {
-                                        led.set();
-                                    } else if packet_buf[i].code_index_number() == 0x08
-                                        || (packet_buf[i].code_index_number() == 0x09
-                                            && packet_buf[i].midi_bytes()[2] == 0)
-                                    {
-                                        led.clear();
+                        // Bulk IN receive buffer — must be in static memory for DMA.
+                        // 64 bytes = max full-speed bulk packet = up to 16 MIDI events.
+                        static mut RECV_BUF: [u8; 64] = [0u8; 64];
+                        let recv_buf = unsafe { &mut *core::ptr::addr_of_mut!(RECV_BUF) };
+
+                        let mut packet_buf = [UsbMidiEventPacket::from_bytes([0; 4]); 16];
+
+                        loop {
+                            match midi.read_packets(recv_buf, &mut packet_buf).await {
+                                Ok(count) => {
+                                    for i in 0..count {
+                                        let note_on = log_midi_packet(&packet_buf[i]);
+                                        if note_on {
+                                            led.set();
+                                        } else if packet_buf[i].code_index_number() == 0x08
+                                            || (packet_buf[i].code_index_number() == 0x09
+                                                && packet_buf[i].midi_bytes()[2] == 0)
+                                        {
+                                            led.clear();
+                                        }
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                log::warn!("MIDI read error: {}", usb_err(&e));
-                                break;
+                                Err(e) => {
+                                    log::warn!("MIDI read error: {}", usb_err(&e));
+                                    break;
+                                }
                             }
                         }
                     }
-                }
-                Some(DeviceEvent::Disconnect(_)) => {
-                    log::info!("DeviceEvent::Disconnect");
-                }
-                Some(DeviceEvent::EnumerationError(hub, port, _err)) => {
-                    log::warn!("DeviceEvent::EnumerationError  hub={} port={}", hub, port);
-                }
-                Some(DeviceEvent::HubConnect(_)) => {}
-                Some(DeviceEvent::None) => {}
-                None => {
-                    log::warn!("Device event stream ended");
-                    break;
+                    Some(DeviceEvent::Disconnect(_)) => {
+                        log::info!("DeviceEvent::Disconnect");
+                        attempt = 0;
+                    }
+                    Some(DeviceEvent::EnumerationError(hub, port, err)) => {
+                        log::warn!(
+                            "DeviceEvent::EnumerationError  hub={} port={} err={}  (attempt {} of {})",
+                            hub,
+                            port,
+                            usb_err(&err),
+                            attempt + 1,
+                            ENUM_ATTEMPTS,
+                        );
+                        if attempt + 1 < ENUM_ATTEMPTS {
+                            attempt += 1;
+                            delay_ms(ENUM_RETRY_PAUSE_MS).await;
+                            log::info!("Retrying with a fresh port reset");
+                            continue 'port;
+                        }
+                        log::warn!(
+                            "Giving up after {} attempts. Unplug the device and plug it in again.",
+                            ENUM_ATTEMPTS
+                        );
+                    }
+                    Some(DeviceEvent::HubConnect(hub)) => {
+                        log::info!("DeviceEvent::HubConnect  addr={}", hub.address());
+                    }
+                    Some(DeviceEvent::None) => {}
+                    None => {
+                        log::warn!("Device event stream ended");
+                        break 'port;
+                    }
                 }
             }
         }
