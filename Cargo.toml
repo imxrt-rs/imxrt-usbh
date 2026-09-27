@@ -37,7 +37,7 @@ imxrt-usbd = "0.4"
 rtic = { version = "2", features = ["thumbv7-backend"] }
 log = "0.4"
 futures = { version = "0.3", default-features = false }
-cotton-usb-host-midi = { path = "../cotton/cotton-usb-host-midi", default-features = false }
+cotton-usb-host-midi = { path = "cotton-usb-host-midi", default-features = false }
 
 [[example]]
 name = "rtic_usb_midi_keyboard"
@@ -46,7 +46,5 @@ required-features = ["imxrt-ral/imxrt1062"]
 [package.metadata.docs.rs]
 default-target = "thumbv7em-none-eabihf"
 
-# One cotton-usb-host for the crate and for the sibling MIDI class crate,
-# otherwise the example sees two copies of the traits.
-[patch.crates-io]
-cotton-usb-host = { path = "../cotton/cotton-usb-host" }
+[workspace]
+members = ["cotton-usb-host-midi"]
