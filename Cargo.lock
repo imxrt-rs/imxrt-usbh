@@ -445,6 +445,7 @@ dependencies = [
  "defmt 0.3.100",
  "futures",
  "futures-core",
+ "imxrt-hal",
  "imxrt-ral",
  "imxrt-rt",
  "imxrt-usbd",

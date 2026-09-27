@@ -44,12 +44,14 @@
 #[rtic::app(device = board, peripherals = false, dispatchers = [BOARD_SWTASK0])]
 mod app {
     use core::pin::pin;
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use cotton_usb_host::device::identify::IdentifyFromDescriptors;
     #[cfg(feature = "hub-support")]
     use cotton_usb_host::usb_bus::HubState;
     use cotton_usb_host::usb_bus::{DeviceEvent, UsbBus};
     use cotton_usb_host_midi::{IdentifyMidi, Midi, UsbMidiEventPacket};
     use futures::StreamExt;
+    use imxrt_hal as hal;
     use imxrt_ral as ral;
     use imxrt_usbh::host::{ImxrtHostController, UsbShared, UsbStatics};
 
@@ -301,7 +303,9 @@ mod app {
     // -----------------------------------------------------------------------
 
     #[local]
-    struct Local {}
+    struct Local {
+        pit: hal::pit::Pit,
+    }
 
     #[shared]
     struct Shared {
@@ -320,10 +324,15 @@ mod app {
                 usbnc1,
                 usbphy1,
                 mut dma,
+                mut pit,
                 ..
             },
             board::Specifics { led, console, .. },
         ) = board::new();
+
+        pit.set_load_timer_value(HEARTBEAT_CHANNEL, board::PIT_FREQUENCY * HEARTBEAT_S);
+        pit.set_interrupt_enable(HEARTBEAT_CHANNEL, true);
+        pit.enable(HEARTBEAT_CHANNEL);
 
         let usbd = imxrt_usbd::Instances {
             usb: usb1,
@@ -336,7 +345,74 @@ mod app {
 
         midi_task::spawn(led).ok();
 
-        (Shared { poller }, Local {})
+        (Shared { poller }, Local { pit })
+    }
+
+    // -----------------------------------------------------------------------
+    // Heartbeat
+    // -----------------------------------------------------------------------
+    //
+    // A line every few seconds, whether or not anything is happening, so that
+    // silence on the console can be told apart from a port with nothing on it.
+    // It runs from a timer interrupt above the MIDI task's priority, so it
+    // also prints if that task is stuck.
+
+    /// Seconds between heartbeat lines.
+    const HEARTBEAT_S: u32 = 5;
+    const HEARTBEAT_CHANNEL: hal::pit::Channel = hal::pit::Channel::Chan2;
+
+    /// The host controller is initialised and its registers may be read.
+    static HOST_READY: AtomicBool = AtomicBool::new(false);
+    /// A MIDI device is configured and being read.
+    static MIDI_READY: AtomicBool = AtomicBool::new(false);
+    /// USB-MIDI event packets received from the current device.
+    static MIDI_MESSAGES: AtomicU32 = AtomicU32::new(0);
+
+    #[task(binds = BOARD_PIT, local = [pit, seconds: u32 = 0], priority = 2)]
+    fn heartbeat(cx: heartbeat::Context) {
+        let pit = cx.local.pit;
+        while pit.is_elapsed(HEARTBEAT_CHANNEL) {
+            pit.clear_elapsed(HEARTBEAT_CHANNEL);
+        }
+        *cx.local.seconds += HEARTBEAT_S;
+        let seconds = *cx.local.seconds;
+
+        if !HOST_READY.load(Ordering::Relaxed) {
+            log::info!("[{:>5}s] starting up", seconds);
+            return;
+        }
+
+        let usb = unsafe { ral::usb::USB2::instance() };
+        let portsc = ral::read_reg!(ral::usb, usb, PORTSC1);
+        // PCE: is the port-change interrupt armed? The ISR masks it and the
+        // device-detect stream re-arms it, so 0 here for long means nobody is
+        // listening for a plug-in.
+        let pce = ral::read_reg!(ral::usb, usb, USBINTR, PCE);
+
+        if MIDI_READY.load(Ordering::Relaxed) {
+            log::info!(
+                "[{:>5}s] USB-MIDI connected, {} messages  (port: CCS={} CSC={} PE={} PEC={} PSPD={} PCE={})",
+                seconds,
+                MIDI_MESSAGES.load(Ordering::Relaxed),
+                portsc & 1,
+                (portsc >> 1) & 1,
+                (portsc >> 2) & 1,
+                (portsc >> 3) & 1,
+                (portsc >> 26) & 3,
+                pce,
+            );
+        } else {
+            log::info!(
+                "[{:>5}s] no USB-MIDI device on the host port  (port: CCS={} CSC={} PE={} PEC={} PSPD={} PCE={})",
+                seconds,
+                portsc & 1,
+                (portsc >> 1) & 1,
+                (portsc >> 2) & 1,
+                (portsc >> 3) & 1,
+                (portsc >> 26) & 3,
+                pce,
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -383,6 +459,7 @@ mod app {
         let statics: &'static UsbStatics = unsafe { &*core::ptr::addr_of!(STATICS) };
         let mut host = ImxrtHostController::new(usb2, usbphy2, &SHARED, statics);
         unsafe { host.init() };
+        HOST_READY.store(true, Ordering::Relaxed);
         log::info!("USB host controller initialised");
 
         unsafe {
@@ -495,6 +572,8 @@ mod app {
                         };
 
                         log::info!("MIDI device ready, reading packets...");
+                        MIDI_MESSAGES.store(0, Ordering::Relaxed);
+                        MIDI_READY.store(true, Ordering::Relaxed);
 
                         // Bulk IN receive buffer — must be in static memory for DMA.
                         // 64 bytes = max full-speed bulk packet = up to 16 MIDI events.
@@ -506,6 +585,7 @@ mod app {
                         loop {
                             match midi.read_packets(recv_buf, &mut packet_buf).await {
                                 Ok(count) => {
+                                    MIDI_MESSAGES.fetch_add(count as u32, Ordering::Relaxed);
                                     for i in 0..count {
                                         let note_on = log_midi_packet(&packet_buf[i]);
                                         if note_on {
@@ -520,6 +600,7 @@ mod app {
                                 }
                                 Err(e) => {
                                     log::warn!("MIDI read error: {}", usb_err(&e));
+                                    MIDI_READY.store(false, Ordering::Relaxed);
                                     break;
                                 }
                             }
@@ -527,6 +608,7 @@ mod app {
                     }
                     Some(DeviceEvent::Disconnect(_)) => {
                         log::info!("DeviceEvent::Disconnect");
+                        MIDI_READY.store(false, Ordering::Relaxed);
                         attempt = 0;
                     }
                     Some(DeviceEvent::EnumerationError(hub, port, err)) => {
