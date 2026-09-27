@@ -31,6 +31,9 @@ hub-support = []
 # `board` is imxrt-hal's unpublished board-support crate, so it comes from git,
 # pinned to the imxrt-hal 0.6.0 line. Bump the rev when moving to a newer HAL.
 board = { git = "https://github.com/imxrt-rs/imxrt-hal", rev = "7f900ae759540eca44332a8dffa8e4d15c7bc4a3", features = ["teensy4"] }
+# The same source and rev as `board`, so that `hal::pit::Pit` here is the type
+# `board::Common` hands out. Keep the two revs equal.
+imxrt-hal = { git = "https://github.com/imxrt-rs/imxrt-hal", rev = "7f900ae759540eca44332a8dffa8e4d15c7bc4a3", features = ["imxrt1060"] }
 imxrt-ral = { version = "0.6", features = ["imxrt1062"] }
 imxrt-rt = "0.1.7"
 imxrt-usbd = "0.4"
