@@ -1,0 +1,20 @@
+[package]
+name = "cotton-usb-host-midi"
+version = "0.1.0"
+description = "USB MIDI class driver for cotton-usb-host: identifies MIDI Streaming interfaces and reads USB-MIDI event packets"
+repository = "https://github.com/imxrt-rs/imxrt-usbh"
+categories = ["embedded", "no-std"]
+keywords = ["usb", "midi", "embedded", "no-std"]
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+cotton-usb-host = { version = "0.3", default-features = false }
+defmt = { version = "1", optional = true }
+
+[features]
+default = ["std"]
+std = ["cotton-usb-host/std"]
+defmt = ["dep:defmt", "cotton-usb-host/defmt"]

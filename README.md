@@ -175,6 +175,26 @@ For local development, the `imxrt-hal` workspace uses a path dependency on
 this crate. Changes to `imxrt-usbh` are picked up automatically when building
 examples.
 
+### USB MIDI
+
+USB MIDI is the one class driver that lives in this repository, as the
+`cotton-usb-host-midi` crate in `cotton-usb-host-midi/`. Cotton keeps only the
+HID and MSC class drivers in-tree (they exercise the whole core and have cheap
+test devices); other classes are meant to be out-of-tree crates, which is what
+this one is. It identifies a MIDI Streaming interface from the descriptors and
+reads 4-byte USB-MIDI event packets over the bulk IN endpoint; output is not
+implemented yet.
+
+The matching Teensy 4.1 example is in this repository rather than `imxrt-hal`:
+
+```sh
+cargo build --release --target thumbv7em-none-eabihf --example rtic_usb_midi_keyboard --features=imxrt-ral/imxrt1062
+```
+
+| Example | Description |
+|---------|-------------|
+| `rtic_usb_midi_keyboard` | Logs Note On/Off, CC and pitch bend from a USB MIDI device, LED on note |
+
 ## Limitations
 
 - **Hub support requires Full Speed**: With the `hub-support` feature, all
