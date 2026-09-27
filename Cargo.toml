@@ -26,11 +26,11 @@ defmt-03 = ["dep:defmt-03"]
 log = ["dep:log"]
 hub-support = []
 
-# The Teensy 4.1 example builds against the sibling checkouts of imxrt-hal
-# (its `board` crate and `imxrt-log`) so the example follows local changes.
+# Dev-dependencies exist for the Teensy 4.1 example only.
 [dev-dependencies]
-board = { path = "../imxrt-hal/board", features = ["teensy4"] }
-imxrt-log = { path = "../imxrt-hal/logging", default-features = false, features = ["log", "lpuart", "usbd"] }
+# `board` is imxrt-hal's unpublished board-support crate, so it comes from git,
+# pinned to the imxrt-hal 0.6.0 line. Bump the rev when moving to a newer HAL.
+board = { git = "https://github.com/imxrt-rs/imxrt-hal", rev = "7f900ae759540eca44332a8dffa8e4d15c7bc4a3", features = ["teensy4"] }
 imxrt-ral = { version = "0.6", features = ["imxrt1062"] }
 imxrt-rt = "0.1.7"
 imxrt-usbd = "0.4"
