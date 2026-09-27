@@ -1,11 +1,65 @@
 //! Device detection stream for the root port.
 
+use super::controller::ImxrtHostController;
 use crate::ral;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use cotton_usb_host::host_controller::{DeviceStatus, UsbSpeed};
 use futures_core::Stream;
 use rtic_common::waker_registration::CriticalSectionWakerRegistration;
+
+// ---------------------------------------------------------------------------
+// What to report: pure logic, no registers
+// ---------------------------------------------------------------------------
+
+/// Decode the device status from a PORTSC1 value.
+fn status_from_portsc(portsc: u32) -> DeviceStatus {
+    use ral::usb::PORTSC1::{CCS, PSPD};
+
+    if portsc & CCS::mask == 0 {
+        return DeviceStatus::Absent;
+    }
+    match (portsc & PSPD::mask) >> PSPD::offset {
+        1 => DeviceStatus::Present(UsbSpeed::Low1_5),
+        2 => DeviceStatus::Present(UsbSpeed::High480),
+        // 0 is full speed; 3 means "not connected" and cannot occur with CCS
+        // set, so it is treated as full speed rather than invented.
+        _ => DeviceStatus::Present(UsbSpeed::Full12),
+    }
+}
+
+/// Decide what a poll of the root port should report, if anything.
+///
+/// `previous` is the status last reported, `now` is the port as it reads at
+/// this moment, and `changed` is PORTSC1.CSC: the controller's latched record
+/// that a device connected or disconnected since the flag was last cleared.
+///
+/// Comparing `previous` with `now` finds a device that arrived or left. It
+/// cannot find one that left *and came back* between two polls, and the
+/// stream is not polled while an enumeration is in flight. Some devices do
+/// exactly that: a Donner StarryCtrl (Jieli chipset) drops off the bus after
+/// its first reset and request, then re-attaches. The level reads "connected"
+/// before and after, but the controller has disabled the port and the device
+/// has lost its state, so every request fails until the port is reset again.
+/// The latched flag is the only evidence, and it turns the bounce into a
+/// disconnect now and, on the next poll, a connect.
+///
+/// A change of speed alone is never reported. EHCI reads full speed from the
+/// line state before a port reset and high speed from the chirp after it, and
+/// reporting that would make cotton-usb-host reset and enumerate a second
+/// time.
+fn port_event(previous: DeviceStatus, now: DeviceStatus, changed: bool) -> Option<DeviceStatus> {
+    let was_connected = matches!(previous, DeviceStatus::Present(_));
+    let is_connected = matches!(now, DeviceStatus::Present(_));
+
+    if was_connected != is_connected {
+        Some(now)
+    } else if is_connected && changed {
+        Some(DeviceStatus::Absent)
+    } else {
+        None
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ImxrtDeviceDetect — Stream<Item = DeviceStatus>
@@ -18,7 +72,10 @@ use rtic_common::waker_registration::CriticalSectionWakerRegistration;
 /// `DeviceStatus::Absent` when disconnected.
 ///
 /// Follows the RP2040 pattern: stores the previous status and only returns
-/// `Ready` when the status changes.
+/// `Ready` when the status changes. In addition it reads the controller's
+/// latched connect-change flag, so a device that disconnects and reconnects
+/// between two polls is reported as `Absent` and then `Present`; see
+/// [`port_event`].
 #[derive(Copy, Clone)]
 pub struct ImxrtDeviceDetect {
     /// USB OTG register block base address (stored as `u32` to keep the struct
@@ -58,20 +115,19 @@ impl ImxrtDeviceDetect {
         }
     }
 
-    /// Read the current device status from PORTSC1.
-    fn read_device_status(&self) -> DeviceStatus {
+    /// Clear the latched connect-change flag, and nothing else.
+    ///
+    /// PORTSC1 mixes ordinary bits with write-one-to-clear flags, so the value
+    /// written back has every such flag masked out except the one being
+    /// cleared.
+    fn clear_connect_change(&self, portsc: u32) {
         let usb = self.usb_instance();
-        let (connected, pspd) = ral::read_reg!(ral::usb, usb, PORTSC1, CCS, PSPD);
-        if connected != 0 {
-            match pspd {
-                0 => DeviceStatus::Present(UsbSpeed::Full12),
-                1 => DeviceStatus::Present(UsbSpeed::Low1_5),
-                2 => DeviceStatus::Present(UsbSpeed::High480),
-                _ => DeviceStatus::Present(UsbSpeed::Full12),
-            }
-        } else {
-            DeviceStatus::Absent
-        }
+        ral::write_reg!(
+            ral::usb,
+            usb,
+            PORTSC1,
+            (portsc & !ImxrtHostController::PORTSC1_W1C_MASK) | ral::usb::PORTSC1::CSC::mask
+        );
     }
 
     /// Re-enable the port change interrupt.
@@ -105,55 +161,139 @@ impl Stream for ImxrtDeviceDetect {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.waker.register(cx.waker());
 
-        let device_status = self.read_device_status();
+        let usb = self.usb_instance();
+        let portsc = ral::read_reg!(ral::usb, usb, PORTSC1);
+        let device_status = status_from_portsc(portsc);
+        let changed = portsc & ral::usb::PORTSC1::CSC::mask != 0;
 
-        // Determine whether this is a connect/disconnect transition.
-        // We intentionally suppress speed-change-only events because EHCI
-        // reports FS before port reset (PSPD from line state) then HS after
-        // reset (PSPD from chirp negotiation). Without this filter, a HS
-        // device triggers two DeviceDetect events: Present(Full12) then
-        // Present(High480), and the second one causes cotton-usb-host to
-        // re-reset the port and re-enumerate, disrupting hub state.
-        let was_connected = matches!(self.status, DeviceStatus::Present(_));
-        let is_connected = matches!(device_status, DeviceStatus::Present(_));
-        let connection_changed = was_connected != is_connected;
-
-        if connection_changed {
-            let usb = self.usb_instance();
-            let portsc = ral::read_reg!(ral::usb, usb, PORTSC1);
-            debug!("[HC] DeviceDetect: status change  PORTSC1=0x{:08X}", portsc);
-
-            // Manage ENHOSTDISCONDETECT based on connection state.
-            // Per i.MX RT reference manual and USBHost_t36: set only when a
-            // High Speed device is connected (HSP=1), clear on disconnect.
-            match device_status {
-                DeviceStatus::Present(UsbSpeed::High480) => {
-                    self.set_enhostdiscondetect();
-                    debug!("[HC] ENHOSTDISCONDETECT set (HS device connected)");
-                }
-                DeviceStatus::Absent => {
-                    self.clear_enhostdiscondetect();
-                }
-                _ => {
-                    // FS/LS device — ensure disconnect detector is off.
-                    self.clear_enhostdiscondetect();
-                }
-            }
-
-            self.reenable_interrupt();
-            self.status = device_status;
-            Poll::Ready(Some(device_status))
-        } else {
-            // Silently track any speed change (e.g. FS→HS after reset) and
-            // manage ENHOSTDISCONDETECT without firing a new event.
-            if device_status != self.status {
-                if matches!(device_status, DeviceStatus::Present(UsbSpeed::High480)) {
-                    self.set_enhostdiscondetect();
-                }
-                self.status = device_status;
-            }
-            self.reenable_interrupt();
-            Poll::Pending
+        // The flag has been read; clear it so that the next one to be seen is
+        // a new event.
+        if changed {
+            self.clear_connect_change(portsc);
         }
+
+        match port_event(self.status, device_status, changed) {
+            Some(report) => {
+                if report != device_status {
+                    debug!(
+                        "[HC] DeviceDetect: device left and came back  PORTSC1=0x{:08X}",
+                        portsc
+                    );
+                } else {
+                    debug!("[HC] DeviceDetect: status change  PORTSC1=0x{:08X}", portsc);
+                }
+
+                // Manage ENHOSTDISCONDETECT based on connection state.
+                // Per i.MX RT reference manual and USBHost_t36: set only when a
+                // High Speed device is connected (HSP=1), clear on disconnect.
+                match report {
+                    DeviceStatus::Present(UsbSpeed::High480) => {
+                        self.set_enhostdiscondetect();
+                        debug!("[HC] ENHOSTDISCONDETECT set (HS device connected)");
+                    }
+                    // Absent, or a FS/LS device: the disconnect detector is off.
+                    _ => self.clear_enhostdiscondetect(),
+                }
+
+                self.reenable_interrupt();
+                self.status = report;
+                Poll::Ready(Some(report))
+            }
+            None => {
+                // Silently track any speed change (e.g. FS→HS after reset) and
+                // manage ENHOSTDISCONDETECT without firing a new event.
+                if device_status != self.status {
+                    if matches!(device_status, DeviceStatus::Present(UsbSpeed::High480)) {
+                        self.set_enhostdiscondetect();
+                    }
+                    self.status = device_status;
+                }
+                self.reenable_interrupt();
+                Poll::Pending
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CCS: u32 = ral::usb::PORTSC1::CCS::mask;
+    const PSPD_SHIFT: u32 = ral::usb::PORTSC1::PSPD::offset;
+
+    const ABSENT: DeviceStatus = DeviceStatus::Absent;
+    const FULL: DeviceStatus = DeviceStatus::Present(UsbSpeed::Full12);
+    const LOW: DeviceStatus = DeviceStatus::Present(UsbSpeed::Low1_5);
+    const HIGH: DeviceStatus = DeviceStatus::Present(UsbSpeed::High480);
+
+    #[test]
+    fn decode_nothing_connected() {
+        assert!(status_from_portsc(0) == ABSENT);
+        // Speed bits read 3 with nothing attached; still absent.
+        assert!(status_from_portsc(3 << PSPD_SHIFT) == ABSENT);
+    }
+
+    #[test]
+    fn decode_each_speed() {
+        assert!(status_from_portsc(CCS) == FULL);
+        assert!(status_from_portsc(CCS | (1 << PSPD_SHIFT)) == LOW);
+        assert!(status_from_portsc(CCS | (2 << PSPD_SHIFT)) == HIGH);
+    }
+
+    #[test]
+    fn decode_values_seen_on_the_bench() {
+        // Teensy 4.1, full-speed device: at attach, and enabled after reset.
+        assert!(status_from_portsc(0x1000_1803) == FULL);
+        assert!(status_from_portsc(0x1000_1807) == FULL);
+        // After an unplug.
+        assert!(status_from_portsc(0x1C00_100A) == ABSENT);
+    }
+
+    #[test]
+    fn a_device_arriving_is_reported() {
+        assert!(port_event(ABSENT, FULL, true) == Some(FULL));
+        // The level alone is enough; the flag may already have been cleared.
+        assert!(port_event(ABSENT, FULL, false) == Some(FULL));
+    }
+
+    #[test]
+    fn a_device_leaving_is_reported() {
+        assert!(port_event(FULL, ABSENT, true) == Some(ABSENT));
+        assert!(port_event(HIGH, ABSENT, false) == Some(ABSENT));
+    }
+
+    #[test]
+    fn nothing_happening_reports_nothing() {
+        assert!(port_event(ABSENT, ABSENT, false).is_none());
+        assert!(port_event(FULL, FULL, false).is_none());
+    }
+
+    #[test]
+    fn a_speed_change_alone_reports_nothing() {
+        // Full speed before the port reset, high speed after the chirp.
+        assert!(port_event(FULL, HIGH, false).is_none());
+    }
+
+    #[test]
+    fn a_device_that_left_and_came_back_is_reported_absent_first() {
+        assert!(port_event(FULL, FULL, true) == Some(ABSENT));
+        // Whatever speed it came back at.
+        assert!(port_event(FULL, HIGH, true) == Some(ABSENT));
+    }
+
+    #[test]
+    fn after_a_bounce_the_next_poll_reports_the_device() {
+        // First poll: flag set, reported absent, flag cleared.
+        let first = port_event(FULL, FULL, true);
+        assert!(first == Some(ABSENT));
+        // Second poll: status is now absent, the device reads present.
+        assert!(port_event(ABSENT, FULL, false) == Some(FULL));
+    }
+
+    #[test]
+    fn a_device_that_came_and_went_reports_nothing() {
+        // Nothing was reported as present, so there is nothing to retract.
+        assert!(port_event(ABSENT, ABSENT, true).is_none());
     }
 }

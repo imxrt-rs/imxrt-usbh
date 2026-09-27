@@ -269,16 +269,18 @@ mod app {
     }
 
     /// Log the root port's status register with the fields that matter during
-    /// a reset picked out: connected, enabled, reset in progress, high-speed,
-    /// and the negotiated speed (0 full, 1 low, 2 high).
+    /// a reset picked out: connected, connect-change latched, enabled, enable
+    /// change latched, reset in progress, high-speed, and the negotiated speed
+    /// (0 full, 1 low, 2 high).
     fn log_port(what: &str) {
         let usb = unsafe { ral::usb::USB2::instance() };
         let portsc = ral::read_reg!(ral::usb, usb, PORTSC1);
         log::info!(
-            "port at {}: PORTSC1=0x{:08X} CCS={} PE={} PEC={} PR={} HSP={} PSPD={}",
+            "port at {}: PORTSC1=0x{:08X} CCS={} CSC={} PE={} PEC={} PR={} HSP={} PSPD={}",
             what,
             portsc,
             portsc & 1,
+            (portsc >> 1) & 1,
             (portsc >> 2) & 1,
             (portsc >> 3) & 1,
             (portsc >> 8) & 1,

@@ -34,12 +34,20 @@ impl HostController for ImxrtHostController {
         } else {
             // Clear PORTSC1.PR — end USB reset signaling.
             // On EHCI, the controller may auto-clear PR and set PE (port enabled).
+            //
+            // The same write clears the latched connect-change flag (CSC).
+            // A reset starts the device's session afresh, so whatever the
+            // port did before or during it, contact bounce at plug-in above
+            // all, is not a reason to enumerate again. Only a change from
+            // here on makes the device-detect stream report that the device
+            // left and came back.
             let portsc = self.portsc1_read_safe();
             crate::ral::write_reg!(
                 crate::ral::usb,
                 self.usb,
                 PORTSC1,
-                portsc & !crate::ral::usb::PORTSC1::PR::mask
+                (portsc & !crate::ral::usb::PORTSC1::PR::mask)
+                    | crate::ral::usb::PORTSC1::CSC::mask
             );
         }
     }
