@@ -52,3 +52,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: cargo test --features=imxrt-ral/imxrt1062 --lib
+
+  # The workspace's other member. The jobs above build, lint and test only the
+  # root package, so without this nothing checks cotton-usb-host-midi but
+  # rustfmt.
+  midi:
+    name: cotton-usb-host-midi
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add clippy
+      - run: rustup target add thumbv7em-none-eabihf
+      # As firmware uses it: no_std, on the Cortex-M7 target.
+      - run: cargo clippy -p cotton-usb-host-midi --no-default-features --target=thumbv7em-none-eabihf -- -D warnings
+      # On the host with std, tests included.
+      - run: cargo clippy -p cotton-usb-host-midi --all-targets -- -D warnings
+      - run: cargo test -p cotton-usb-host-midi
