@@ -181,9 +181,10 @@ USB MIDI is the one class driver that lives in this repository, as the
 `cotton-usb-host-midi` crate in `cotton-usb-host-midi/`. Cotton keeps only the
 HID and MSC class drivers in-tree (they exercise the whole core and have cheap
 test devices); other classes are meant to be out-of-tree crates, which is what
-this one is. It identifies a MIDI Streaming interface from the descriptors and
-reads 4-byte USB-MIDI event packets over the bulk IN endpoint; output is not
-implemented yet.
+this one is. It identifies a MIDI Streaming interface from the descriptors,
+reads 4-byte USB-MIDI event packets over the bulk IN endpoint, and writes them
+over the bulk OUT endpoint. A read and a write can be in flight at once, each
+on its own endpoint.
 
 The matching Teensy 4.1 example is in this repository rather than `imxrt-hal`:
 
