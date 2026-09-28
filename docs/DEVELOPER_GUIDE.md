@@ -347,17 +347,23 @@ All host-mode register fields are present in `imxrt-ral`:
 
 ### USB2 Host Port
 
-The secondary USB port uses a **5-pin header** on the Teensy 4.1 (directly behind
-the Ethernet jack). The host port is **not powered from the programming USB
-connector** — you must supply external 5V to VBUS.
+The secondary USB port is a row of **five unpopulated through-holes** on the
+Teensy 4.1, next to the Ethernet pads. Solder in a 5-pin header yourself. Pin
+order is from PJRC's Teensy 4.1 pinout card (back side):
 
 | Pin | Signal | Notes |
 |-----|--------|-------|
-| 1 | GND | |
-| 2 | D+ | |
-| 3 | D- | |
-| 4 | VBUS | Connect to external 5V supply |
-| 5 | ID | Leave unconnected (host mode) |
+| 1 | +5V | Switched VBUS (see below) |
+| 2 | D- | |
+| 3 | D+ | |
+| 4 | GND | |
+| 5 | GND | |
+
+No external supply is needed. +5V comes from the board's own 5V rail through a
+current-limited load switch, so a Teensy powered only from the programming USB
+connector can power a host-port device. The PC port, the Teensy, and the device
+share one 5V budget. Power-hungry devices or bus-powered hubs may need the board
+powered through VIN, or a self-powered hub.
 
 ### VBUS Power Control
 
