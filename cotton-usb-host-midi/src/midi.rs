@@ -196,13 +196,27 @@ impl IdentifyFromDescriptors for IdentifyMidi {
     }
 }
 
+/// Copy as many whole packets from `packets` into `buf` as it holds, and
+/// return how many that was.
+fn pack(buf: &mut [u8], packets: &[UsbMidiEventPacket]) -> usize {
+    let count = packets.len().min(buf.len() / 4);
+    for (chunk, packet) in buf.chunks_exact_mut(4).zip(&packets[..count]) {
+        chunk.copy_from_slice(packet.as_bytes());
+    }
+    count
+}
+
 /// USB MIDI device driver.
 ///
-/// Holds bulk endpoint handles and provides packet-based read access.
+/// Holds bulk endpoint handles and provides packet-based read and write
+/// access. [`read_packets`](Self::read_packets) and
+/// [`write_packets`](Self::write_packets) both take `&self` and use different
+/// endpoints, so they can run concurrently, for example under
+/// `futures::future::select`, with a read left pending while a write goes out.
 pub struct Midi<'a, HC: HostController> {
     bus: &'a UsbBus<HC>,
     bulk_in: BulkIn,
-    _bulk_out: Option<BulkOut>,
+    bulk_out: Option<BulkOut>,
 }
 
 impl<'a, HC: HostController> Midi<'a, HC> {
@@ -225,8 +239,14 @@ impl<'a, HC: HostController> Midi<'a, HC> {
         Ok(Self {
             bus,
             bulk_in,
-            _bulk_out: bulk_out,
+            bulk_out,
         })
+    }
+
+    /// Whether the device has a bulk OUT endpoint, so that
+    /// [`write_packets`](Self::write_packets) can send to it.
+    pub fn has_out_endpoint(&self) -> bool {
+        self.bulk_out.is_some()
     }
 
     /// Perform one bulk IN transfer and parse the received data into
@@ -269,11 +289,88 @@ impl<'a, HC: HostController> Midi<'a, HC> {
         }
         Ok(count)
     }
+
+    /// Send USB-MIDI event packets to the device over the bulk OUT endpoint.
+    ///
+    /// - `send_buf`: Buffer for the raw USB bulk transfers. It must be in
+    ///   DMA-accessible memory (not stack/DTCM on Cortex-M7), like `recv_buf`
+    ///   in [`read_packets`](Self::read_packets), and hold at least one
+    ///   4-byte packet. Each transfer carries as many whole packets as it
+    ///   holds; 64 bytes, one full-speed bulk packet, carries 16.
+    /// - `packets`: The packets to send, in order. Each carries its own cable
+    ///   number and Code Index Number; see [`UsbMidiEventPacket`].
+    ///
+    /// Sends `packets` in as many transfers as it takes and returns how many
+    /// packets were sent, which is all of them unless there is an error. On
+    /// an error, the transfers before it have been sent.
+    ///
+    /// Fails with [`UsbError::NoSuchEndpoint`] if the device has no bulk OUT
+    /// endpoint (see [`has_out_endpoint`](Self::has_out_endpoint)), and with
+    /// [`UsbError::BufferTooSmall`] if `send_buf` cannot hold one packet.
+    pub async fn write_packets(
+        &self,
+        send_buf: &mut [u8],
+        packets: &[UsbMidiEventPacket],
+    ) -> Result<usize, UsbError> {
+        let bulk_out = self.bulk_out.as_ref().ok_or(UsbError::NoSuchEndpoint)?;
+        if send_buf.len() < 4 {
+            return Err(UsbError::BufferTooSmall);
+        }
+
+        let mut sent = 0;
+        while sent < packets.len() {
+            let count = pack(send_buf, &packets[sent..]);
+            // USB-MIDI needs no zero-length packet after a transfer that
+            // fills whole packets, so the transfer is fixed-size.
+            self.bus
+                .bulk_out_transfer(bulk_out, &send_buf[..count * 4], TransferType::FixedSize)
+                .await?;
+            sent += count;
+        }
+        Ok(sent)
+    }
 }
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
+
+    fn note_on(note: u8) -> UsbMidiEventPacket {
+        UsbMidiEventPacket::from_bytes([0x09, 0x90, note, 127])
+    }
+
+    #[test]
+    fn test_pack_fits_everything() {
+        let packets = [note_on(1), note_on(2)];
+        let mut buf = [0xAA; 16];
+        assert_eq!(pack(&mut buf, &packets), 2);
+        assert_eq!(&buf[..8], &[0x09, 0x90, 1, 127, 0x09, 0x90, 2, 127]);
+        // Beyond the packed packets, the buffer is untouched.
+        assert_eq!(&buf[8..], &[0xAA; 8]);
+    }
+
+    #[test]
+    fn test_pack_stops_at_buffer_capacity() {
+        let packets: Vec<_> = (0..20).map(note_on).collect();
+        let mut buf = [0; 64];
+        assert_eq!(pack(&mut buf, &packets), 16);
+        assert_eq!(&buf[60..64], &[0x09, 0x90, 15, 127]);
+    }
+
+    #[test]
+    fn test_pack_ignores_a_partial_packet_of_space() {
+        let packets = [note_on(1), note_on(2)];
+        let mut buf = [0; 7];
+        assert_eq!(pack(&mut buf, &packets), 1);
+        let mut small = [0; 3];
+        assert_eq!(pack(&mut small, &packets), 0);
+    }
+
+    #[test]
+    fn test_pack_nothing() {
+        let mut buf = [0; 64];
+        assert_eq!(pack(&mut buf, &[]), 0);
+    }
 
     #[test]
     fn test_note_on_packet() {
