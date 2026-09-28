@@ -29,20 +29,34 @@ used for programming.
 
 ### Hardware Setup
 
-The Teensy 4.1 USB2 host port uses a 5-pin header (directly behind the
-Ethernet jack). You must supply **external 5V** to the VBUS pin — the host
-port is not powered from the programming USB connector.
+The Teensy 4.1 USB2 host port is a row of five unpopulated through-holes
+next to the Ethernet pads. Solder in a 5-pin header yourself. PJRC's
+[USB Host Cable](https://www.pjrc.com/store/cable_usb_host_t36.html) plugs
+onto that header and provides a USB-A receptacle.
 
 | Pin | Signal | Notes |
 |-----|--------|-------|
-| 1   | GND    |       |
-| 2   | D+     |       |
-| 3   | D-     |       |
-| 4   | VBUS   | Connect to external 5V supply |
-| 5   | ID     | Leave unconnected (host mode) |
+| 1   | +5V    | Switched VBUS from the board's 5V rail |
+| 2   | D-     |       |
+| 3   | D+     |       |
+| 4   | GND    |       |
+| 5   | GND    |       |
 
-Connect a USB device (keyboard, flash drive, or hub) via a USB-A breakout
-wired to D+, D-, GND, and VBUS.
+(Pin order as printed on PJRC's Teensy 4.1 pinout card, back side.)
+
+**Power:** the host port's +5V comes from the board's own 5V rail through a
+current-limited load switch, so no external supply is needed. A Teensy
+powered only from the programming USB connector can power a device on the
+host port. The switch is off at reset; firmware must turn it on by driving
+`GPIO_EMC_40` (GPIO8 bit 26) high. The examples do this (see
+[Clock Prerequisites](#clock-prerequisites)).
+
+The PC port, the Teensy, and the attached device all share one 5V budget
+(typically 500 mA from a USB 2.0 port). For power-hungry devices or a
+bus-powered hub with several devices, power the Teensy through VIN with a
+larger supply, or use a self-powered hub. If you power the board through VIN
+while also connected to a PC, cut the VIN/VUSB pad on the bottom of the
+board.
 
 ## Supported Devices
 
