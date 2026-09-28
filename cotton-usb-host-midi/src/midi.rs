@@ -280,11 +280,9 @@ impl<'a, HC: HostController> Midi<'a, HC> {
                 recv_buf[offset + 2],
                 recv_buf[offset + 3],
             ]);
-            if !pkt.is_empty() {
-                if count < packet_buf.len() {
-                    packet_buf[count] = pkt;
-                    count += 1;
-                }
+            if !pkt.is_empty() && count < packet_buf.len() {
+                packet_buf[count] = pkt;
+                count += 1;
             }
         }
         Ok(count)
